@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'dart:math';
 
 void main() {
@@ -132,7 +136,6 @@ class _HomeScreenState extends State<HomeScreen> {
   late List<Map<String, dynamic>> _filteredStudies;
   String _searchQuery = '';
 
-  // --- Add these for selection logic ---
   bool _selectionMode = false;
   Set<int> _selectedStudies = {};
 
@@ -193,7 +196,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _deleteSelectedStudies() {
     setState(() {
-      // Remove from _allStudies by matching filteredStudies
       List<Map<String, dynamic>> toDelete = _selectedStudies.map((i) => _filteredStudies[i]).toList();
       _allStudies.removeWhere((s) => toDelete.contains(s));
       _filteredStudies.removeWhere((s) => toDelete.contains(s));
@@ -226,14 +228,12 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       body: Stack(
         children: [
-          // --- Background X-ray image ---
           Positioned.fill(
             child: Image.asset(
               'assets/chest_xray.jpg',
               fit: BoxFit.cover,
             ),
           ),
-          // --- Gradient overlay ---
           Positioned.fill(
             child: Container(
               decoration: BoxDecoration(
@@ -248,7 +248,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
           ),
-          // --- Main content ---
           Column(
             children: [
               Padding(
@@ -327,57 +326,142 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class UploadScreen extends StatelessWidget {
+// ---- Updated UploadScreen ----
+
+class UploadScreen extends StatefulWidget {
   final Function(Map<String, dynamic>)? onNewStudy;
   const UploadScreen({super.key, this.onNewStudy});
 
-  Future<void> _pickFiles(BuildContext context) async {
-    final result = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['dcm', 'jpeg', 'jpg', 'jp2'],
-      allowMultiple: false,
-    );
-    if (result != null && result.files.isNotEmpty) {
-      final file = result.files.first;
-      final newStudy = {
-        'patientName': 'New Patient',
-        'studyDate': DateTime.now().toIso8601String().substring(0, 10),
-        'description': 'Uploaded Study',
-        'series': [
-          {
-            'seriesDescription': file.name,
-            'thumbnail': Icons.new_releases,
-            'images': List.generate(10, (i) => '${file.name} Image ${i + 1}')
-          }
-        ]
-      };
-      if (onNewStudy != null) {
-        onNewStudy!(newStudy);
+  @override
+  State<UploadScreen> createState() => _UploadScreenState();
+}
+
+class _UploadScreenState extends State<UploadScreen> {
+  bool _uploading = false;
+  String? _status;
+
+  Future<List<File>> getAllFilesInFolder(String folderPath) async {
+    final dir = Directory(folderPath);
+    final List<File> files = [];
+    if (await dir.exists()) {
+      await for (var entity in dir.list(recursive: true, followLinks: false)) {
+        if (entity is File) {
+          files.add(entity);
+        }
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Selected: ${file.name} - Added as new study')),
-      );
+    }
+    return files;
+  }
+
+  Future<void> pickAndUploadFilesAndFolders() async {
+    setState(() { _status = null; });
+
+    // Pick files
+    FilePickerResult? fileResult = await FilePicker.platform.pickFiles(
+      allowMultiple: true,
+      allowedExtensions: ['dcm', 'dicom', 'jpg', 'jpeg', 'jp2', 'png', 'bmp'],
+      type: FileType.custom,
+    );
+
+    List<File> filesToUpload = [];
+    if (fileResult != null) {
+      for (var file in fileResult.files) {
+        if (file.path != null) filesToUpload.add(File(file.path!));
+      }
+    }
+
+    // Pick folder (desktop/web only)
+    String? folderPath;
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      folderPath = await FilePicker.platform.getDirectoryPath(dialogTitle: 'Pick a folder (optional)');
+      if (folderPath != null) {
+        List<File> folderFiles = await getAllFilesInFolder(folderPath);
+        filesToUpload.addAll(folderFiles.where((f) => ['.dcm','.dicom','.jpg','.jpeg','.jp2','.png','.bmp']
+            .contains(p.extension(f.path).toLowerCase())));
+      }
+    }
+
+    if (filesToUpload.isEmpty) {
+      setState(() { _status = "No files or folders selected."; });
+      return;
+    }
+
+    setState(() { _uploading = true; });
+    try {
+      const String apiBase = "http://127.0.0.1:8000"; // Change for your backend
+      var uri = Uri.parse("$apiBase/upload/");
+      var request = http.MultipartRequest('POST', uri);
+      for (var file in filesToUpload) {
+        request.files.add(await http.MultipartFile.fromPath('files', file.path));
+      }
+      var streamed = await request.send();
+      var response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        setState(() {
+          _status = "Upload successful!";
+        });
+      } else {
+        setState(() {
+          _status = "Upload failed: ${response.body}";
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _status = "Upload error: $e";
+      });
+    } finally {
+      setState(() {
+        _uploading = false;
+      });
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Upload DICOM')),
+      appBar: AppBar(title: const Text('Upload DICOM/Image Files or Folders')),
       body: Center(
-        child: ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: Colors.grey[900],
-            foregroundColor: Colors.white,
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.upload_file),
+                label: const Text("Pick files/folders and upload"),
+                onPressed: _uploading ? null : pickAndUploadFilesAndFolders,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                ),
+              ),
+              if (_uploading) ...[
+                const SizedBox(height: 20),
+                const CircularProgressIndicator(),
+                const SizedBox(height: 8),
+                const Text('Uploading...', style: TextStyle(color: Colors.white)),
+              ],
+              if (_status != null) ...[
+                const SizedBox(height: 24),
+                Text(
+                  _status!,
+                  style: TextStyle(
+                    color: _status!.toLowerCase().contains("success") ? Colors.green : Colors.red,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ],
           ),
-          onPressed: () => _pickFiles(context),
-          icon: const Icon(Icons.upload_file),
-          label: const Text('Select DICOM/JPEG/JP2 File'),
         ),
       ),
     );
   }
 }
+
+// ---- ViewerScreen and the rest of your code remains unchanged ----
 
 enum MPRView { axial, coronal, sagittal }
 enum MeasurementMode { none, linear, circle }
@@ -445,7 +529,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
             children: [
               const Text("Export Options", style: TextStyle(fontSize: 20, color: Colors.white, fontWeight: FontWeight.bold)),
               const SizedBox(height: 16),
-              // --- Single series export options ---
               Row(
                 children: [
                   const Icon(Icons.image, color: Colors.blueAccent),
@@ -514,7 +597,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
                 ],
               ),
               const Divider(color: Colors.white38, height: 32),
-              // --- Entire study export options ---
               Row(
                 children: [
                   const Icon(Icons.collections, color: Colors.blueGrey),
