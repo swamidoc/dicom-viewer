@@ -21,7 +21,8 @@ def make_json_serializable(obj):
     return str(obj)
 
 def extract_study_structure(study_path: str) -> List[Dict[str, Any]]:
-    """Extracts DICOM structure: series and images per series."""
+    """Extracts DICOM structure: series and images per series.
+    Each image also includes pixelSpacingX, pixelSpacingY, Columns, Rows (for accurate overlays)."""
     series_dict = {}
     for fname in os.listdir(study_path):
         if fname.lower().endswith('.dcm'):
@@ -35,6 +36,11 @@ def extract_study_structure(study_path: str) -> List[Dict[str, Any]]:
                 if not sop_uid:
                     sop_uid = "IMG_" + hashlib.md5((fname).encode()).hexdigest()
                 series_desc = getattr(ds, "SeriesDescription", "Series")
+                px_spacing = ds.get("PixelSpacing", [1.0, 1.0])
+                spacing_x = float(px_spacing[1]) if len(px_spacing) > 1 else float(px_spacing[0])
+                spacing_y = float(px_spacing[0])
+                cols = int(getattr(ds, "Columns", 512))
+                rows = int(getattr(ds, "Rows", 512))
                 if series_uid not in series_dict:
                     series_dict[series_uid] = {
                         "series_id": series_uid,
@@ -45,6 +51,10 @@ def extract_study_structure(study_path: str) -> List[Dict[str, Any]]:
                     "image_id": sop_uid,
                     "filename": fname,
                     "instanceNumber": int(getattr(ds, "InstanceNumber", 0)),
+                    "pixelSpacingX": spacing_x,
+                    "pixelSpacingY": spacing_y,
+                    "Columns": cols,
+                    "Rows": rows,
                 })
             except Exception:
                 continue
@@ -114,12 +124,32 @@ def list_studies():
                 {
                     "series_id": "demo_axial",
                     "seriesDescription": "Axial Demo CT",
-                    "images": [{"image_id": f"demo_ax_{i}", "filename": f"demo_ax_{i}.dcm", "instanceNumber": i} for i in range(1, 11)],
+                    "images": [
+                        {
+                            "image_id": f"demo_ax_{i}",
+                            "filename": f"demo_ax_{i}.dcm",
+                            "instanceNumber": i,
+                            "pixelSpacingX": 1.0,
+                            "pixelSpacingY": 1.0,
+                            "Columns": 512,
+                            "Rows": 512,
+                        } for i in range(1, 11)
+                    ],
                 },
                 {
                     "series_id": "demo_coronal",
                     "seriesDescription": "Coronal Demo CT",
-                    "images": [{"image_id": f"demo_cor_{i}", "filename": f"demo_cor_{i}.dcm", "instanceNumber": i} for i in range(1, 9)],
+                    "images": [
+                        {
+                            "image_id": f"demo_cor_{i}",
+                            "filename": f"demo_cor_{i}.dcm",
+                            "instanceNumber": i,
+                            "pixelSpacingX": 1.0,
+                            "pixelSpacingY": 1.0,
+                            "Columns": 512,
+                            "Rows": 512,
+                        } for i in range(1, 9)
+                    ],
                 },
             ]
         })
@@ -142,12 +172,12 @@ def get_study_detail(study_id: str):
 
 @app.get("/studies/{study_id}/series/{series_id}/image/{image_id}")
 def get_image(
-    study_id: str,
-    series_id: str,
-    image_id: str,
-    format: str = "raw",
-    window: float = None,
-    level: float = None,
+        study_id: str,
+        series_id: str,
+        image_id: str,
+        format: str = "raw",
+        window: float = None,
+        level: float = None,
 ):
     study_path = os.path.join("./uploads", study_id)
     if not os.path.exists(study_path):
@@ -180,13 +210,16 @@ def get_image(
             ds = pydicom.dcmread(dcm_path)
             arr = ds.pixel_array.astype(np.float32)
             # --- Window/Level logic ---
-            # Reference: https://radiopaedia.org/articles/windowing-ct
             if window is not None and level is not None:
                 w = float(window)
                 l = float(level)
-                arr = np.clip((arr - (l - 0.5)) / (w - 1) + 0.5, 0, 1) * 255
+            elif hasattr(ds, "WindowWidth") and hasattr(ds, "WindowCenter"):
+                w = float(ds.WindowWidth[0] if isinstance(ds.WindowWidth, pydicom.multival.MultiValue) else ds.WindowWidth)
+                l = float(ds.WindowCenter[0] if isinstance(ds.WindowCenter, pydicom.multival.MultiValue) else ds.WindowCenter)
             else:
-                arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-5) * 255.0
+                w = arr.max() - arr.min()
+                l = (arr.max() + arr.min()) / 2.0
+            arr = np.clip((arr - (l - 0.5)) / (w - 1) + 0.5, 0, 1) * 255
             arr = arr.astype(np.uint8)
             img = Image.fromarray(arr)
             buf = io.BytesIO()
@@ -197,3 +230,48 @@ def get_image(
             raise HTTPException(500, "Failed to convert DICOM to JPEG")
     else:
         raise HTTPException(400, "Unknown format requested")
+
+@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}/metadata")
+def get_image_metadata(study_id: str, series_id: str, image_id: str):
+    """
+    Return pixel spacing and image size for a particular image.
+    """
+    study_path = os.path.join("./uploads", study_id)
+    if not os.path.exists(study_path):
+        raise HTTPException(404, "Study not found")
+    files = os.listdir(study_path)
+    for fname in files:
+        if not fname.lower().endswith('.dcm'):
+            continue
+        try:
+            ds = pydicom.dcmread(os.path.join(study_path, fname), stop_before_pixels=True, force=True)
+            sid = getattr(ds, "SeriesInstanceUID", None)
+            iid = getattr(ds, "SOPInstanceUID", None)
+            if not sid:
+                sid = "SERIES_" + hashlib.md5((fname).encode()).hexdigest()
+            if not iid:
+                iid = "IMG_" + hashlib.md5((fname).encode()).hexdigest()
+            if sid == series_id and iid == image_id:
+                px_spacing = ds.get("PixelSpacing", [1.0, 1.0])
+                spacing_x = float(px_spacing[1]) if len(px_spacing) > 1 else float(px_spacing[0])
+                spacing_y = float(px_spacing[0])
+                cols = int(getattr(ds, "Columns", 512))
+                rows = int(getattr(ds, "Rows", 512))
+                return {
+                    "pixelSpacingX": spacing_x,
+                    "pixelSpacingY": spacing_y,
+                    "Columns": cols,
+                    "Rows": rows
+                }
+        except Exception:
+            continue
+    raise HTTPException(404, "Image not found")
+
+@app.delete("/studies/{study_id}")
+def delete_study(study_id: str):
+    study_path = os.path.join("./uploads", study_id)
+    if os.path.exists(study_path) and os.path.isdir(study_path):
+        shutil.rmtree(study_path)
+        return {"detail": "Study deleted"}
+    else:
+        raise HTTPException(status_code=404, detail="Study not found")
