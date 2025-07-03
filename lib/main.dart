@@ -7,9 +7,22 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'dart:convert';
-import 'package:flutter/material.dart';
 import 'dart:math' as math;
 import 'dart:async';
+import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:file_picker/file_picker.dart';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'dart:convert';
+import 'dart:math' as math;
+import 'dart:async';
+import 'package:cached_network_image/cached_network_image.dart';
+
 
 // --- Color options ---
 const List<Color> markupColors = [
@@ -19,7 +32,7 @@ const List<Color> markupColors = [
   Colors.blue,
   Colors.cyan,
 ];
-
+const String proxyBase = "http://127.0.0.1:8010";
 void main() {
   runApp(const DicomViewerApp());
 }
@@ -49,7 +62,6 @@ class DicomViewerApp extends StatelessWidget {
     );
   }
 }
-
 class MainNavigation extends StatefulWidget {
   const MainNavigation({super.key});
   @override
@@ -93,10 +105,6 @@ class _MainNavigationState extends State<MainNavigation> {
                     "image_id": "demo_ax_${i + 1}",
                     "filename": "demo_ax_${i + 1}.dcm",
                     "instanceNumber": i + 1,
-                    "pixelSpacingX": 1.0,
-                    "pixelSpacingY": 1.0,
-                    "Columns": 512,
-                    "Rows": 512,
                   }),
                 },
                 {
@@ -107,10 +115,6 @@ class _MainNavigationState extends State<MainNavigation> {
                     "image_id": "demo_cor_${i + 1}",
                     "filename": "demo_cor_${i + 1}.dcm",
                     "instanceNumber": i + 1,
-                    "pixelSpacingX": 1.0,
-                    "pixelSpacingY": 1.0,
-                    "Columns": 512,
-                    "Rows": 512,
                   }),
                 },
               ],
@@ -431,7 +435,6 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
-
 class UploadScreen extends StatefulWidget {
   final Function(Map<String, dynamic>)? onNewStudy;
   const UploadScreen({super.key, this.onNewStudy});
@@ -443,6 +446,7 @@ class UploadScreen extends StatefulWidget {
 class _UploadScreenState extends State<UploadScreen> {
   bool _uploading = false;
   String? _status;
+  double _uploadProgress = 0;
 
   Future<List<File>> getAllFilesInFolder(String folderPath) async {
     final dir = Directory(folderPath);
@@ -460,6 +464,7 @@ class _UploadScreenState extends State<UploadScreen> {
   Future<void> pickAndUploadFolder() async {
     setState(() {
       _status = null;
+      _uploadProgress = 0;
     });
 
     String? folderPath = await FilePicker.platform
@@ -493,28 +498,156 @@ class _UploadScreenState extends State<UploadScreen> {
 
     setState(() {
       _uploading = true;
+      _uploadProgress = 0;
     });
+
     try {
-      const String apiBase = "http://127.0.0.1:8000";
-      var uri = Uri.parse("$apiBase/upload/");
+      var uri = Uri.parse("$proxyBase/proxy/upload/");
       var request = http.MultipartRequest('POST', uri);
+
       for (var file in filesToUpload) {
-        request.files
-            .add(await http.MultipartFile.fromPath('files', file.path));
+        request.files.add(
+          http.MultipartFile(
+            'files',
+            file.openRead(),
+            file.lengthSync(),
+            filename: p.basename(file.path),
+          ),
+        );
       }
       var streamed = await request.send();
       var response = await http.Response.fromStream(streamed);
 
       if (response.statusCode == 200) {
-        setState(() {
-          _status = "Upload successful!";
-        });
-        if (widget.onNewStudy != null) {
-          widget.onNewStudy!({});
+        final respJson = json.decode(response.body);
+        if (respJson['task_id'] != null) {
+          String taskId = respJson['task_id'];
+          // Poll progress
+          while (true) {
+            await Future.delayed(const Duration(milliseconds: 700));
+            var progressResp = await http.get(Uri.parse("$proxyBase/proxy/progress/$taskId"));
+            var progressData = json.decode(progressResp.body);
+            double percent = (progressData['percent'] ?? 0.0).toDouble();
+            setState(() {
+              _uploadProgress = percent;
+            });
+            if ((progressData['status'] ?? "").startsWith("done") ||
+                (progressData['status'] ?? "").startsWith("error")) {
+              setState(() {
+                _status = progressData['status'] == "done" ? "Upload successful!" : "Upload failed: ${progressData['status']}";
+                _uploadProgress = 1.0;
+              });
+              if (widget.onNewStudy != null && progressData['status'] == "done") {
+                widget.onNewStudy!({});
+              }
+              break;
+            }
+          }
         }
       } else {
         setState(() {
-          _status = "Upload failed: ${response.body}";
+          try {
+            final errorJson = json.decode(response.body);
+            _status = "Upload failed: ${errorJson['detail'] ?? response.body}";
+          } catch (e) {
+            _status = "Upload failed: ${response.body}";
+          }
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _status = "Upload error: $e";
+      });
+    } finally {
+      setState(() {
+        _uploading = false;
+      });
+    }
+  }
+
+  Future<void> pickAndUploadZip() async {
+    setState(() {
+      _status = null;
+      _uploadProgress = 0;
+    });
+
+    FilePickerResult? result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['zip'],
+    );
+    if (result == null || result.files.single.path == null) {
+      setState(() {
+        _status = "No zip file selected.";
+      });
+      return;
+    }
+
+    String zipPath = result.files.single.path!;
+    File zipFile = File(zipPath);
+    if (!zipFile.existsSync()) {
+      setState(() {
+        _status = "Zip file not found.";
+      });
+      return;
+    }
+
+    setState(() {
+      _uploading = true;
+      _uploadProgress = 0;
+    });
+
+    try {
+      var uri = Uri.parse("$proxyBase/proxy/upload_zip/");
+      var request = http.MultipartRequest('POST', uri);
+
+      int totalSize = zipFile.lengthSync();
+
+      request.files.add(
+        http.MultipartFile(
+          'file',
+          zipFile.openRead(),
+          totalSize,
+          filename: p.basename(zipFile.path),
+        ),
+      );
+
+      var streamed = await request.send();
+      var response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode == 200) {
+        final respJson = json.decode(response.body);
+        if (respJson['task_id'] != null) {
+          String taskId = respJson['task_id'];
+          // Poll progress
+          while (true) {
+            await Future.delayed(const Duration(milliseconds: 700));
+            var progressResp = await http.get(Uri.parse("$proxyBase/proxy/progress/$taskId"));
+            var progressData = json.decode(progressResp.body);
+            double percent = (progressData['percent'] ?? 0.0).toDouble();
+            setState(() {
+              _uploadProgress = percent;
+            });
+            if ((progressData['status'] ?? "").startsWith("done") ||
+                (progressData['status'] ?? "").startsWith("error")) {
+              setState(() {
+                _status = progressData['status'] == "done" ? "Upload successful!" : "Upload failed: ${progressData['status']}";
+                _uploadProgress = 1.0;
+              });
+              if (widget.onNewStudy != null && progressData['status'] == "done") {
+                widget.onNewStudy!({});
+              }
+              break;
+            }
+          }
+        }
+      } else {
+        setState(() {
+          try {
+            final errorJson = json.decode(response.body);
+            _status = "Upload failed: ${errorJson['detail'] ?? response.body}";
+          } catch (e) {
+            _status = "Upload failed: ${response.body}";
+          }
         });
       }
     } catch (e) {
@@ -531,7 +664,7 @@ class _UploadScreenState extends State<UploadScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Upload DICOM/Image Folder')),
+      appBar: AppBar(title: const Text('Upload DICOM Study (ZIP preferred for large studies)')),
       body: Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -539,22 +672,45 @@ class _UploadScreenState extends State<UploadScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               ElevatedButton.icon(
-                icon: const Icon(Icons.folder_open),
-                label: const Text("Select folder and upload"),
-                onPressed: _uploading ? null : pickAndUploadFolder,
+                icon: const Icon(Icons.archive),
+                label: const Text("Select ZIP and upload"),
+                onPressed: _uploading ? null : pickAndUploadZip,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.blue,
                   foregroundColor: Colors.white,
-                  padding:
-                  const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
                 ),
               ),
-              if (_uploading) ...[
-                const SizedBox(height: 20),
-                const CircularProgressIndicator(),
-                const SizedBox(height: 8),
-                const Text('Uploading...', style: TextStyle(color: Colors.white)),
-              ],
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.folder_open),
+                label: const Text("Select folder and upload (recommended <1000 files)"),
+                onPressed: _uploading ? null : pickAndUploadFolder,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.green[700],
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                ),
+              ),
+              if (_uploading || _uploadProgress > 0)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 24),
+                  child: Column(
+                    children: [
+                      LinearProgressIndicator(
+                        value: _uploadProgress,
+                        minHeight: 10,
+                        backgroundColor: Colors.grey[800],
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.blueAccent),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Uploading... ${(_uploadProgress * 100).toStringAsFixed(1)}%',
+                        style: const TextStyle(color: Colors.white70, fontSize: 15),
+                      ),
+                    ],
+                  ),
+                ),
               if (_status != null) ...[
                 const SizedBox(height: 24),
                 Text(
@@ -567,6 +723,12 @@ class _UploadScreenState extends State<UploadScreen> {
                   ),
                 ),
               ],
+              const SizedBox(height: 18),
+              const Text(
+                "For large studies (many images), compress the study folder to a ZIP and upload using the first button above.",
+                style: TextStyle(color: Colors.white70, fontSize: 13),
+                textAlign: TextAlign.center,
+              ),
             ],
           ),
         ),
@@ -574,6 +736,8 @@ class _UploadScreenState extends State<UploadScreen> {
     );
   }
 }
+
+
 // --- Enum & Helper Classes ---
 enum MPRView { axial, coronal, sagittal }
 enum MarkupTool { arrow, line, circle, pen }
@@ -583,23 +747,52 @@ class LinearMeasurement {
   final Offset start;
   final Offset end;
   LinearMeasurement({required this.start, required this.end});
+
+  double get pixelDistance => (end - start).distance;
+
+  double realWorldDistance(double pixelSpacingX, double pixelSpacingY) {
+    if (pixelSpacingX <= 0 || pixelSpacingY <= 0) return pixelDistance;
+    final dx = (end.dx - start.dx) * pixelSpacingX;
+    final dy = (end.dy - start.dy) * pixelSpacingY;
+    return math.sqrt(dx * dx + dy * dy);
+  }
 }
 
 class CircleMeasurement {
   final Offset center;
   final Offset edge;
   CircleMeasurement({required this.center, required this.edge});
+
+  double get pixelRadius => (edge - center).distance;
+
+  double realWorldRadius(double pixelSpacingX, double pixelSpacingY) {
+    if (pixelSpacingX <= 0 || pixelSpacingY <= 0) return pixelRadius;
+    final avgPixelSpacing = (pixelSpacingX + pixelSpacingY) / 2.0;
+    return pixelRadius * avgPixelSpacing;
+  }
+
+  double realWorldDiameter(double pixelSpacingX, double pixelSpacingY) {
+    return realWorldRadius(pixelSpacingX, pixelSpacingY) * 2.0;
+  }
+
+  double realWorldArea(double pixelSpacingX, double pixelSpacingY) {
+    final r = realWorldRadius(pixelSpacingX, pixelSpacingY);
+    return math.pi * r * r;
+  }
 }
 
 class MarkupObject {
   final MarkupTool tool;
   final Color color;
-  final List<Offset>? points;
-  final List<Offset>? penPoints;
-  MarkupObject({required this.tool, required this.color, this.points, this.penPoints});
+  final List<Offset> points;
+  final List<Offset> penPoints;
+  MarkupObject({
+    required this.tool,
+    required this.color,
+    this.points = const [],
+    this.penPoints = const [],
+  });
 }
-
-// LinearMeasurement, CircleMeasurement, MarkupTool, MarkupObject as in your code...
 
 class MarkupPainter extends CustomPainter {
   final List<LinearMeasurement> lineMeasurements;
@@ -610,10 +803,12 @@ class MarkupPainter extends CustomPainter {
   final MarkupTool markupTool;
   final Color markupColor;
   final List<Offset>? markupTempPoints;
+
   final double pixelSpacingX;
   final double pixelSpacingY;
-  final bool showRealWorld;
   final Size imageSize;
+  final double currentZoom;
+  final Offset currentPanOffset;
 
   MarkupPainter({
     required this.lineMeasurements,
@@ -626,153 +821,253 @@ class MarkupPainter extends CustomPainter {
     this.markupTempPoints,
     required this.pixelSpacingX,
     required this.pixelSpacingY,
-    this.showRealWorld = true,
     required this.imageSize,
+    required this.currentZoom,
+    required this.currentPanOffset,
   });
+
+  Offset imageToCanvas(Offset imagePoint, Size canvasSize) {
+    if (imageSize.isEmpty || currentZoom == 0) return imagePoint;
+    double actualFittedBoxScale;
+    Offset fittedBoxVisualOffset = Offset.zero;
+
+    if (canvasSize.width <= 0 ||
+        canvasSize.height <= 0 ||
+        imageSize.width <= 0 ||
+        imageSize.height <= 0) {
+      return imagePoint;
+    }
+
+    if (canvasSize.width / canvasSize.height > imageSize.width / imageSize.height) {
+      actualFittedBoxScale = canvasSize.height / imageSize.height;
+      double scaledWidth = imageSize.width * actualFittedBoxScale;
+      fittedBoxVisualOffset = Offset((canvasSize.width - scaledWidth) / 2, 0);
+    } else {
+      actualFittedBoxScale = canvasSize.width / imageSize.width;
+      double scaledHeight = imageSize.height * actualFittedBoxScale;
+      fittedBoxVisualOffset = Offset(0, (canvasSize.height - scaledHeight) / 2);
+    }
+    if (actualFittedBoxScale == 0) return imagePoint;
+
+    Offset pointAfterFittedBoxScaling = imagePoint * actualFittedBoxScale;
+    Size fittedBoxOutputSize = imageSize * actualFittedBoxScale;
+    Offset centerOfFittedBoxOutput =
+    Offset(fittedBoxOutputSize.width / 2, fittedBoxOutputSize.height / 2);
+
+    Offset pointAfterZoom =
+        ((pointAfterFittedBoxScaling - centerOfFittedBoxOutput) * currentZoom) +
+            centerOfFittedBoxOutput;
+    Offset pointAfterFittedBoxOffset = pointAfterZoom + fittedBoxVisualOffset;
+    return pointAfterFittedBoxOffset + currentPanOffset;
+  }
+
+  void _drawMeasurementText(Canvas canvas, String text, Offset textCanvasPosition,
+      double zoom, Paint backgroundPaint) {
+    final textStyle = TextStyle(
+      color: Colors.white,
+      fontSize: math.max(8.0, 12.0 / zoom),
+      fontWeight: FontWeight.bold,
+      shadows: [Shadow(blurRadius: 1, color: Colors.black.withOpacity(0.7))],
+    );
+    final textSpan = TextSpan(text: text, style: textStyle);
+    final textPainter = TextPainter(
+      text: textSpan,
+      textAlign: TextAlign.center,
+      textDirection: TextDirection.ltr,
+    );
+    textPainter.layout(minWidth: 0, maxWidth: math.max(50, 200 / zoom));
+
+    final rectWidth = textPainter.width + (8 / zoom);
+    final rectHeight = textPainter.height + (4 / zoom);
+    final rectX = textCanvasPosition.dx - rectWidth / 2;
+    final rectY = textCanvasPosition.dy - textPainter.height / 2 - (2 / zoom);
+
+    final RRect backgroundRRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(rectX, rectY, rectWidth, rectHeight),
+        Radius.circular(math.max(1.0, 3.0 / zoom)));
+    canvas.drawRRect(backgroundRRect, backgroundPaint);
+    textPainter.paint(
+        canvas, Offset(textCanvasPosition.dx - textPainter.width / 2, rectY + (2 / zoom)));
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
-    // BoxFit.contain calculation
-    final double scale = math.min(size.width / imageSize.width, size.height / imageSize.height);
-    final double dx = (size.width - imageSize.width * scale) / 2;
-    final double dy = (size.height - imageSize.height * scale) / 2;
-    canvas.save();
-    canvas.translate(dx, dy);
-    canvas.scale(scale);
-
-    final paint = Paint()
-      ..strokeWidth = 2 / scale // so lines look same at all zooms!
+    final linePaint = Paint()
+      ..strokeWidth = math.max(0.5, 2.0 / currentZoom)
       ..style = PaintingStyle.stroke;
+    final textBackgroundPaint = Paint()..color = Colors.black.withOpacity(0.6);
 
-    // Draw lines
-    for (final m in lineMeasurements) {
-      paint.color = Colors.yellow;
-      canvas.drawLine(m.start, m.end, paint);
-      if (showRealWorld) {
-        final label = _realWorldLength(m.start, m.end);
-        final mid = Offset((m.start.dx + m.end.dx) / 2, (m.start.dy + m.end.dy) / 2);
-        _drawLabel(canvas, label, mid, scale);
-      }
+    for (var line in lineMeasurements) {
+      final startOnCanvas = imageToCanvas(line.start, size);
+      final endOnCanvas = imageToCanvas(line.end, size);
+      canvas.drawLine(startOnCanvas, endOnCanvas, linePaint..color = Colors.yellow);
+      final distanceMm = line.realWorldDistance(pixelSpacingX, pixelSpacingY);
+      final midPointOnCanvas = Offset(
+          (startOnCanvas.dx + endOnCanvas.dx) / 2,
+          (startOnCanvas.dy + endOnCanvas.dy) / 2);
+      _drawMeasurementText(canvas, "${distanceMm.toStringAsFixed(1)} mm",
+          midPointOnCanvas + Offset(0, -10 / currentZoom), currentZoom, textBackgroundPaint);
     }
     if (tempLine != null) {
-      paint.color = Colors.yellow.withOpacity(0.7);
-      canvas.drawLine(tempLine!.start, tempLine!.end, paint);
-      if (showRealWorld) {
-        final label = _realWorldLength(tempLine!.start, tempLine!.end);
-        final mid = Offset((tempLine!.start.dx + tempLine!.end.dx) / 2, (tempLine!.start.dy + tempLine!.end.dy) / 2);
-        _drawLabel(canvas, label, mid, scale);
-      }
+      final startOnCanvas = imageToCanvas(tempLine!.start, size);
+      final endOnCanvas = imageToCanvas(tempLine!.end, size);
+      canvas.drawLine(startOnCanvas, endOnCanvas, linePaint..color = Colors.orangeAccent);
+      final distanceMm = tempLine!.realWorldDistance(pixelSpacingX, pixelSpacingY);
+      final midPointOnCanvas = Offset(
+          (startOnCanvas.dx + endOnCanvas.dx) / 2,
+          (startOnCanvas.dy + endOnCanvas.dy) / 2);
+      _drawMeasurementText(canvas, "${distanceMm.toStringAsFixed(1)} mm",
+          midPointOnCanvas + Offset(0, -10 / currentZoom), currentZoom, textBackgroundPaint);
     }
 
-    // Draw circles
-    for (final m in circleMeasurements) {
-      paint.color = Colors.cyan;
-      canvas.drawCircle(m.center, (m.center - m.edge).distance, paint);
-      if (showRealWorld) {
-        final label = _realWorldCircleInfo(m.center, m.edge);
-        _drawLabel(canvas, label, m.center + Offset((m.center - m.edge).distance, 0), scale);
-      }
+    final circlePaint = Paint()
+      ..strokeWidth = math.max(0.5, 2.0 / currentZoom)
+      ..style = PaintingStyle.stroke;
+
+    for (var circle in circleMeasurements) {
+      final centerOnCanvas = imageToCanvas(circle.center, size);
+      final radiusInOriginalPixels = circle.pixelRadius;
+      final p1 = imageToCanvas(Offset.zero, size);
+      final p2 = imageToCanvas(Offset(radiusInOriginalPixels, 0), size);
+      final radiusOnCanvas = (p2 - p1).distance;
+
+      canvas.drawCircle(centerOnCanvas, radiusOnCanvas, circlePaint..color = Colors.cyan);
+      final diameterMm = circle.realWorldDiameter(pixelSpacingX, pixelSpacingY);
+      _drawMeasurementText(canvas, "D: ${diameterMm.toStringAsFixed(1)} mm",
+          centerOnCanvas + Offset(0, -radiusOnCanvas - (10 / currentZoom)), currentZoom, textBackgroundPaint);
     }
     if (tempCircle != null) {
-      paint.color = Colors.cyan.withOpacity(0.7);
-      canvas.drawCircle(tempCircle!.center, (tempCircle!.center - tempCircle!.edge).distance, paint);
-      if (showRealWorld) {
-        final label = _realWorldCircleInfo(tempCircle!.center, tempCircle!.edge);
-        _drawLabel(canvas, label, tempCircle!.center + Offset((tempCircle!.center - tempCircle!.edge).distance, 0), scale);
-      }
+      final centerOnCanvas = imageToCanvas(tempCircle!.center, size);
+      final radiusInOriginalPixels = tempCircle!.pixelRadius;
+      final p1 = imageToCanvas(Offset.zero, size);
+      final p2 = imageToCanvas(Offset(radiusInOriginalPixels, 0), size);
+      final radiusOnCanvas = (p2 - p1).distance;
+
+      canvas.drawCircle(centerOnCanvas, radiusOnCanvas, circlePaint..color = Colors.purpleAccent);
+      final diameterMm = tempCircle!.realWorldDiameter(pixelSpacingX, pixelSpacingY);
+      _drawMeasurementText(canvas, "D: ${diameterMm.toStringAsFixed(1)} mm",
+          centerOnCanvas + Offset(0, -radiusOnCanvas - (10 / currentZoom)), currentZoom, textBackgroundPaint);
     }
 
-    // Markups (lines, circles, pen)
-    for (final m in markups) {
-      paint.color = m.color;
-      switch (m.tool) {
-        case MarkupTool.arrow:
-        case MarkupTool.line:
-          if (m.points != null && m.points!.length == 2) {
-            canvas.drawLine(m.points![0], m.points![1], paint);
-          }
-          break;
-        case MarkupTool.circle:
-          if (m.points != null && m.points!.length == 2) {
-            final r = (m.points![0] - m.points![1]).distance;
-            canvas.drawCircle(m.points![0], r, paint);
-          }
-          break;
-        case MarkupTool.pen:
-          if (m.penPoints != null && m.penPoints!.length > 1) {
-            for (int i = 0; i < m.penPoints!.length - 1; i++) {
-              canvas.drawLine(m.penPoints![i], m.penPoints![i + 1], paint);
-            }
-          }
-          break;
+    markups.forEach((markup) {
+      final paint = Paint()
+        ..color = markup.color
+        ..strokeWidth =
+        math.max(0.5, (markup.tool == MarkupTool.pen ? 2.0 : 3.0) / currentZoom)
+        ..style = (markup.tool == MarkupTool.circle && markup.points.length == 2)
+            ? PaintingStyle.stroke
+            : PaintingStyle.stroke
+        ..strokeCap = markup.tool == MarkupTool.pen ? StrokeCap.round : StrokeCap.butt;
+      if (markup.tool == MarkupTool.pen && markup.penPoints.isNotEmpty) {
+        Path path = Path();
+        final startPoint = imageToCanvas(markup.penPoints.first, size);
+        path.moveTo(startPoint.dx, startPoint.dy);
+        for (int i = 1; i < markup.penPoints.length; i++) {
+          final point = imageToCanvas(markup.penPoints[i], size);
+          path.lineTo(point.dx, point.dy);
+        }
+        canvas.drawPath(path, paint);
+      } else if (markup.points.length == 2) {
+        final startCanvas = imageToCanvas(markup.points[0], size);
+        final endCanvas = imageToCanvas(markup.points[1], size);
+
+        if (markup.tool == MarkupTool.line) {
+          canvas.drawLine(startCanvas, endCanvas, paint);
+        } else if (markup.tool == MarkupTool.arrow) {
+          canvas.drawLine(startCanvas, endCanvas, paint);
+          final angle =
+          math.atan2(endCanvas.dy - startCanvas.dy, endCanvas.dx - startCanvas.dx);
+          final arrowSize = math.max(3.0, 10.0 / currentZoom);
+          Path arrowPath = Path()
+            ..moveTo(
+                endCanvas.dx - arrowSize * math.cos(angle - math.pi / 6),
+                endCanvas.dy - arrowSize * math.sin(angle - math.pi / 6))
+            ..lineTo(endCanvas.dx, endCanvas.dy)
+            ..lineTo(
+                endCanvas.dx - arrowSize * math.cos(angle + math.pi / 6),
+                endCanvas.dy - arrowSize * math.sin(angle + math.pi / 6));
+          canvas.drawPath(arrowPath, paint..style = PaintingStyle.stroke);
+        } else if (markup.tool == MarkupTool.circle) {
+          final centerCanvas =
+          Offset((startCanvas.dx + endCanvas.dx) / 2, (startCanvas.dy + endCanvas.dy) / 2);
+          final radiusCanvas = (endCanvas - startCanvas).distance / 2;
+          canvas.drawCircle(centerCanvas, radiusCanvas, paint);
+        }
+      }
+    });
+
+    if (markupTempPoints != null &&
+        markupTempPoints!.length == 2 &&
+        (markupTool == MarkupTool.line ||
+            markupTool == MarkupTool.arrow ||
+            markupTool == MarkupTool.circle)) {
+      final startCanvas = imageToCanvas(markupTempPoints![0], size);
+      final endCanvas = imageToCanvas(markupTempPoints![1], size);
+      final tempPaint = Paint()
+        ..color = markupColor.withOpacity(0.7)
+        ..strokeWidth = math.max(0.5, 3.0 / currentZoom)
+        ..style = PaintingStyle.stroke;
+      if (markupTool == MarkupTool.line) {
+        canvas.drawLine(startCanvas, endCanvas, tempPaint);
+      } else if (markupTool == MarkupTool.arrow) {
+        canvas.drawLine(startCanvas, endCanvas, tempPaint);
+        final angle =
+        math.atan2(endCanvas.dy - startCanvas.dy, endCanvas.dx - startCanvas.dx);
+        final arrowSize = math.max(3.0, 10.0 / currentZoom);
+        Path arrowPath = Path()
+          ..moveTo(
+              endCanvas.dx - arrowSize * math.cos(angle - math.pi / 6),
+              endCanvas.dy - arrowSize * math.sin(angle - math.pi / 6))
+          ..lineTo(endCanvas.dx, endCanvas.dy)
+          ..lineTo(
+              endCanvas.dx - arrowSize * math.cos(angle + math.pi / 6),
+              endCanvas.dy - arrowSize * math.sin(angle + math.pi / 6));
+        canvas.drawPath(arrowPath, tempPaint..style = PaintingStyle.stroke);
+      } else if (markupTool == MarkupTool.circle) {
+        final centerCanvas =
+        Offset((startCanvas.dx + endCanvas.dx) / 2, (startCanvas.dy + endCanvas.dy) / 2);
+        final radiusCanvas = (endCanvas - startCanvas).distance / 2;
+        canvas.drawCircle(centerCanvas, radiusCanvas, tempPaint);
+      }
+    } else if (markupTool == MarkupTool.pen &&
+        markupTempPoints != null &&
+        markupTempPoints!.isNotEmpty) {
+      final tempPenPaint = Paint()
+        ..color = markupColor.withOpacity(0.7)
+        ..strokeWidth = math.max(0.5, 2.0 / currentZoom)
+        ..strokeCap = StrokeCap.round
+        ..style = PaintingStyle.stroke;
+      Path path = Path();
+      if (markupTempPoints!.isNotEmpty) {
+        final startPoint = imageToCanvas(markupTempPoints!.first, size);
+        path.moveTo(startPoint.dx, startPoint.dy);
+        for (int i = 1; i < markupTempPoints!.length; i++) {
+          final point = imageToCanvas(markupTempPoints![i], size);
+          path.lineTo(point.dx, point.dy);
+        }
+        canvas.drawPath(path, tempPenPaint);
       }
     }
-
-    if (markupTempPoints != null && markupTempPoints!.length > 1) {
-      paint.color = markupColor.withOpacity(0.7);
-      switch (markupTool) {
-        case MarkupTool.arrow:
-        case MarkupTool.line:
-          canvas.drawLine(markupTempPoints![0], markupTempPoints![1], paint);
-          break;
-        case MarkupTool.circle:
-          final r = (markupTempPoints![0] - markupTempPoints![1]).distance;
-          canvas.drawCircle(markupTempPoints![0], r, paint);
-          break;
-        case MarkupTool.pen:
-          for (int i = 0; i < markupTempPoints!.length - 1; i++) {
-            canvas.drawLine(markupTempPoints![i], markupTempPoints![i + 1], paint);
-          }
-          break;
-      }
-    }
-    canvas.restore();
-  }
-
-  String _realWorldLength(Offset a, Offset b) {
-    final dx = (a.dx - b.dx) * pixelSpacingX;
-    final dy = (a.dy - b.dy) * pixelSpacingY;
-    final mm = math.sqrt(dx * dx + dy * dy);
-    return "${mm.toStringAsFixed(2)} mm";
-  }
-
-  String _realWorldCircleInfo(Offset a, Offset b) {
-    final rmm = _realWorldCircleRadius(a, b);
-    final diamMM = 2 * rmm;
-    final areaMM = math.pi * rmm * rmm;
-    return "D: ${diamMM.toStringAsFixed(2)} mm\nA: ${areaMM.toStringAsFixed(2)} mm²";
-  }
-
-  double _realWorldCircleRadius(Offset a, Offset b) {
-    final dx = (a.dx - b.dx) * pixelSpacingX;
-    final dy = (a.dy - b.dy) * pixelSpacingY;
-    return math.sqrt(dx * dx + dy * dy);
-  }
-
-  void _drawLabel(Canvas canvas, String label, Offset pos, double scale) {
-    final textStyle = TextStyle(
-      color: Colors.yellow,
-      fontSize: 13 / scale,
-      fontWeight: FontWeight.bold,
-      backgroundColor: Colors.black87,
-    );
-    final tp = TextPainter(
-      text: TextSpan(text: label, style: textStyle),
-      textDirection: TextDirection.ltr,
-      textAlign: TextAlign.center,
-      maxLines: 2,
-    )..layout();
-    // Make label scale with zoom for readability!
-    canvas.drawRect(
-      Rect.fromLTWH(pos.dx, pos.dy - tp.height / 2, tp.width + 4, tp.height + 2),
-      Paint()..color = Colors.black.withOpacity(0.7),
-    );
-    tp.paint(canvas, Offset(pos.dx + 2, pos.dy - tp.height / 2 + 1));
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant MarkupPainter oldDelegate) {
+    return oldDelegate.lineMeasurements != lineMeasurements ||
+        oldDelegate.circleMeasurements != circleMeasurements ||
+        oldDelegate.tempLine != tempLine ||
+        oldDelegate.tempCircle != tempCircle ||
+        oldDelegate.markups != markups ||
+        oldDelegate.markupTool != markupTool ||
+        oldDelegate.markupColor != markupColor ||
+        oldDelegate.markupTempPoints != markupTempPoints ||
+        oldDelegate.pixelSpacingX != pixelSpacingX ||
+        oldDelegate.pixelSpacingY != pixelSpacingY ||
+        oldDelegate.imageSize != imageSize ||
+        oldDelegate.currentZoom != currentZoom ||
+        oldDelegate.currentPanOffset != currentPanOffset;
+  }
 }
+
 // --- Viewer Screen Widget ---
 class ViewerScreen extends StatefulWidget {
   final Map<String, dynamic> study;
@@ -786,6 +1081,13 @@ class _ViewerScreenState extends State<ViewerScreen> {
   int _selectedSeries = 0;
   int _currentImageIndex = 0;
 
+  bool _mprMode = false;
+  String _mprOrientation = 'axial';
+  int _mprNumSlices = 1;
+  int _mprSliceIndex = 0;
+  bool _seriesLoading = false;
+  double _seriesLoadingProgress = 0.0;
+
   MPRView _currentView = MPRView.axial;
   double _zoom = 1.0;
   final double _minZoom = 0.5;
@@ -794,7 +1096,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
 
   MeasurementMode _measurementMode = MeasurementMode.none;
   MarkupTool? _markupTool;
-  Color _activeColor = markupColors[0];
+  Color _activeColor = Colors.yellow;
 
   List<LinearMeasurement> _linearMeasurements = [];
   List<CircleMeasurement> _circleMeasurements = [];
@@ -804,7 +1106,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
   List<dynamic> _seriesList = [];
   List<dynamic> _images = [];
 
-  // Set window/level defaults to 2000/1000 and REMOVE all window/level slider UI
   static const double defaultWindow = 2000;
   static const double defaultLevel = 1000;
   double _window = defaultWindow;
@@ -862,104 +1163,151 @@ class _ViewerScreenState extends State<ViewerScreen> {
   void initState() {
     super.initState();
     _seriesList = widget.study['series'] ?? [];
-    _window = defaultWindow;
-    _level = defaultLevel;
     _loadSeries();
   }
-
-  void _loadSeries() {
+  Future<void> _enterMprMode(String orientation) async {
+    final studyId = widget.study['study_id'];
+    final url = 'http://127.0.0.1:8000/studies/$studyId/mpr_info?orientation=$orientation';
+    final resp = await http.get(Uri.parse(url));
+    int numSlices = 1;
+    if (resp.statusCode == 200) {
+      final data = json.decode(resp.body);
+      numSlices = data['num_slices'] ?? 1;
+    }
     setState(() {
-      _images = _seriesList.isNotEmpty ? (_seriesList[_selectedSeries]['images'] ?? []) : [];
-      _currentImageIndex = 0;
-      _window = defaultWindow;
-      _level = defaultLevel;
+      _mprMode = true;
+      _mprOrientation = orientation;
+      _mprNumSlices = numSlices;
+      _mprSliceIndex = 0;
     });
   }
-
   Offset pointerToImageCoords({
     required Offset pointer,
     required Size displaySize,
     required Size imageSize,
   }) {
-    final double scale = math.min(
-      displaySize.width / imageSize.width,
-      displaySize.height / imageSize.height,
-    );
-    final double dx = (displaySize.width - imageSize.width * scale) / 2;
-    final double dy = (displaySize.height - imageSize.height * scale) / 2;
-    final double x = (pointer.dx - dx) / scale;
-    final double y = (pointer.dy - dy) / scale;
-    return Offset(x, y);
+    double actualFittedBoxScale;
+    Offset fittedBoxVisualOffset = Offset.zero;
+    if (displaySize.width / displaySize.height > imageSize.width / imageSize.height) {
+      actualFittedBoxScale = displaySize.height / imageSize.height;
+      double scaledWidth = imageSize.width * actualFittedBoxScale;
+      fittedBoxVisualOffset = Offset((displaySize.width - scaledWidth) / 2, 0);
+    } else {
+      actualFittedBoxScale = displaySize.width / imageSize.width;
+      double scaledHeight = imageSize.height * actualFittedBoxScale;
+      fittedBoxVisualOffset = Offset(0, (displaySize.height - scaledHeight) / 2);
+    }
+    if (actualFittedBoxScale == 0 || _zoom == 0) return Offset.zero;
+
+    Size fittedBoxOutputSize = imageSize * actualFittedBoxScale;
+    Offset centerOfFittedBoxOutput = Offset(fittedBoxOutputSize.width / 2, fittedBoxOutputSize.height / 2);
+
+    Offset p = pointer - _panOffset;
+    p = p - fittedBoxVisualOffset;
+    p = (p - centerOfFittedBoxOutput) / _zoom + centerOfFittedBoxOutput;
+    Offset imageCoord = p / actualFittedBoxScale;
+
+    return imageCoord;
+  }
+  Future<void> _prefetchAllImages() async {
+    if (_mprMode) return; // Only prefetch in series mode
+    setState(() {
+      _seriesLoading = true;
+      _seriesLoadingProgress = 0;
+    });
+    int n = _images.length;
+    if (n == 0) {
+      setState(() {
+        _seriesLoading = false;
+        _seriesLoadingProgress = 1.0;
+      });
+      return;
+    }
+    for (int i = 0; i < n; ++i) {
+      final img = _images[i];
+      final url =
+          "http://127.0.0.1:8000/studies/${widget.study['study_id']}/series/${_seriesList[_selectedSeries]['series_id']}/image/${img['image_id']}?format=jpeg";
+      await precacheImage(CachedNetworkImageProvider(url), context);
+      setState(() {
+        _seriesLoadingProgress = (i + 1) / n;
+      });
+    }
+    setState(() {
+      _seriesLoading = false;
+      _seriesLoadingProgress = 1.0;
+    });
   }
 
-  // --- PATCH: Fetch pixel spacing from backend for each image if needed (optional robustness) ---
-  Future<void> fetchPixelSpacingFromBackend() async {
-    if (_images.isEmpty) return;
-    final img = _images[_currentImageIndex];
-    final studyId = widget.study['study_id'];
-    final seriesId = _seriesList[_selectedSeries]['series_id'];
-    final imageId = img['image_id'];
-    final url = 'http://127.0.0.1:8000/studies/$studyId/series/$seriesId/image/$imageId/metadata';
-    try {
-      final resp = await http.get(Uri.parse(url));
-      if (resp.statusCode == 200) {
-        final meta = jsonDecode(resp.body);
-        setState(() {
-          img['pixelSpacingX'] = meta['pixelSpacingX'];
-          img['pixelSpacingY'] = meta['pixelSpacingY'];
-          img['Columns'] = meta['Columns'];
-          img['Rows'] = meta['Rows'];
-        });
-      }
-    } catch (e) {
-      // fallback: keep previous values
-    }
+  void _loadSeries() {
+    setState(() {
+      _mprMode = false;
+      _mprSliceIndex = 0;
+      _images = _seriesList.isNotEmpty ? (_seriesList[_selectedSeries]['images'] ?? []) : [];
+      _currentImageIndex = 0;
+      _window = defaultWindow;
+      _level = defaultLevel;
+      _seriesLoading = true;
+      _seriesLoadingProgress = 0;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _prefetchAllImages();
+    });
   }
 
   Widget _sliceSlider() {
-    if (_images.isEmpty) return const SizedBox.shrink();
+    int maxIdx = _mprMode ? (_mprNumSlices - 1) : (_images.length - 1);
+    int currentIdx = _mprMode ? _mprSliceIndex : _currentImageIndex;
+    if (maxIdx < 0) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24.0),
       child: Row(
         children: [
           IconButton(
             icon: const Icon(Icons.chevron_left, color: Colors.white),
-            onPressed: _currentImageIndex > 0
+            onPressed: currentIdx > 0
                 ? () => setState(() {
-              _currentImageIndex--;
-              fetchPixelSpacingFromBackend();
+              if (_mprMode) {
+                _mprSliceIndex--;
+              } else {
+                _currentImageIndex--;
+              }
             })
                 : null,
           ),
           Expanded(
             child: Slider(
-              value: _currentImageIndex.toDouble(),
+              value: currentIdx.toDouble(),
               min: 0,
-              max: (_images.length - 1).toDouble(),
-              divisions: _images.length > 1 ? _images.length - 1 : 1,
-              label: "Slice ${_currentImageIndex + 1}",
+              max: maxIdx.toDouble(),
+              divisions: maxIdx > 0 ? maxIdx : 1,
+              label: "Slice ${currentIdx + 1}",
               activeColor: Colors.blueAccent,
               inactiveColor: Colors.grey,
-              onChanged: (v) =>
-                  setState(() {
-                    _currentImageIndex = v.round();
-                    fetchPixelSpacingFromBackend();
-                  }),
+              onChanged: (v) => setState(() {
+                if (_mprMode) {
+                  _mprSliceIndex = v.round();
+                } else {
+                  _currentImageIndex = v.round();
+                }
+              }),
             ),
           ),
           IconButton(
             icon: const Icon(Icons.chevron_right, color: Colors.white),
-            onPressed: _currentImageIndex < _images.length - 1
+            onPressed: currentIdx < maxIdx
                 ? () => setState(() {
-              _currentImageIndex++;
-              fetchPixelSpacingFromBackend();
+              if (_mprMode) {
+                _mprSliceIndex++;
+              } else {
+                _currentImageIndex++;
+              }
             })
                 : null,
           ),
           Padding(
             padding: const EdgeInsets.only(left: 8.0),
             child: Text(
-              "${_currentImageIndex + 1}/${_images.length}",
+              "${currentIdx + 1}/${maxIdx + 1}",
               style: const TextStyle(color: Colors.white, fontSize: 14),
             ),
           ),
@@ -968,6 +1316,38 @@ class _ViewerScreenState extends State<ViewerScreen> {
     );
   }
 
+  Widget _mprDropdown() => DropdownButton<String>(
+    value: _mprMode ? _mprOrientation : null,
+    hint: const Text("MPR", style: TextStyle(color: Colors.white)),
+    dropdownColor: Colors.grey[900],
+    iconEnabledColor: Colors.white,
+    underline: const SizedBox(),
+    items: [
+      const DropdownMenuItem(
+        value: null,
+        child: Text("Series Mode", style: TextStyle(color: Colors.white70)),
+      ),
+      const DropdownMenuItem(
+        value: 'axial',
+        child: Text("Axial MPR", style: TextStyle(color: Colors.white)),
+      ),
+      const DropdownMenuItem(
+        value: 'coronal',
+        child: Text("Coronal MPR", style: TextStyle(color: Colors.white)),
+      ),
+      const DropdownMenuItem(
+        value: 'sagittal',
+        child: Text("Sagittal MPR", style: TextStyle(color: Colors.white)),
+      ),
+    ],
+    onChanged: (String? val) async {
+      if (val == null) {
+        _loadSeries();
+      } else {
+        await _enterMprMode(val);
+      }
+    },
+  );
 
   Widget _topToolsRow() => Row(
     mainAxisAlignment: MainAxisAlignment.start,
@@ -1021,44 +1401,6 @@ class _ViewerScreenState extends State<ViewerScreen> {
         ),
       ),
     ],
-  );
-
-  Widget _mprDropdown() => DropdownButton<MPRView>(
-    value: _currentView,
-    dropdownColor: Colors.grey[900],
-    iconEnabledColor: Colors.white,
-    underline: const SizedBox(),
-    items: MPRView.values.map((view) {
-      return DropdownMenuItem<MPRView>(
-        value: view,
-        child: Row(
-          children: [
-            Icon(
-              view == MPRView.axial
-                  ? Icons.crop_16_9
-                  : view == MPRView.coronal
-                  ? Icons.view_agenda
-                  : Icons.view_column,
-              color: Colors.white,
-              size: 20,
-            ),
-            const SizedBox(width: 8),
-            Text(
-              view.name[0].toUpperCase() + view.name.substring(1),
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-            ),
-          ],
-        ),
-      );
-    }).toList(),
-    onChanged: (selectedView) {
-      if (selectedView != null) {
-        setState(() {
-          _currentView = selectedView;
-          _currentImageIndex = 0;
-        });
-      }
-    },
   );
 
   Widget _measurementButtonDropdown() {
@@ -1203,7 +1545,13 @@ class _ViewerScreenState extends State<ViewerScreen> {
         dropdownColor: Colors.grey[900],
         iconEnabledColor: Colors.white,
         underline: const SizedBox(),
-        items: markupColors.map((color) {
+        items: [
+          Colors.yellow,
+          Colors.red,
+          Colors.green,
+          Colors.blue,
+          Colors.cyan
+        ].map((color) {
           return DropdownMenuItem<Color>(
             value: color,
             child: Icon(Icons.circle, color: color, size: 22),
@@ -1249,20 +1597,26 @@ class _ViewerScreenState extends State<ViewerScreen> {
       ),
       onPressed: () async {
         try {
-          RenderRepaintBoundary boundary = _exportKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
+          RenderRepaintBoundary boundary =
+          _exportKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
           ui.Image image = await boundary.toImage(pixelRatio: 3.0);
           ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
           if (byteData != null) {
             final pngBytes = byteData.buffer.asUint8List();
-            String fileName = "dicom_annotated_${DateTime.now().millisecondsSinceEpoch}.png";
+            String fileName =
+                "dicom_annotated_${DateTime.now().millisecondsSinceEpoch}.png";
             String? dir;
             if (Platform.isAndroid || Platform.isIOS) {
               showDialog(
                 context: context,
                 builder: (ctx) => AlertDialog(
                   title: const Text('Export Complete'),
-                  content: const Text('Annotated image copied to clipboard or use Share in real app.'),
-                  actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+                  content: const Text(
+                      'Annotated image copied to clipboard or use Share in real app.'),
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
+                  ],
                 ),
               );
             } else {
@@ -1274,7 +1628,10 @@ class _ViewerScreenState extends State<ViewerScreen> {
                 builder: (ctx) => AlertDialog(
                   title: const Text('Export Complete'),
                   content: Text('Saved as $fileName in $dir'),
-                  actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+                  actions: [
+                    TextButton(
+                        onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
+                  ],
                 ),
               );
             }
@@ -1285,7 +1642,9 @@ class _ViewerScreenState extends State<ViewerScreen> {
             builder: (ctx) => AlertDialog(
               title: const Text('Export Failed'),
               content: Text(e.toString()),
-              actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))],
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
+              ],
             ),
           );
         }
@@ -1299,49 +1658,34 @@ class _ViewerScreenState extends State<ViewerScreen> {
   Widget build(BuildContext context) {
     final Size imageSize = dicomImageSize;
 
-    Widget imageWidget;
-    if (isDemo) {
-      imageWidget = Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(_seriesList[_selectedSeries]['thumbnail'],
-              size: 64, color: Colors.grey.shade700),
-          Text(
-            _images.isNotEmpty
-                ? _images[_currentImageIndex]['filename'] ?? ""
-                : "",
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-                fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white),
-          ),
-        ],
-      );
+    String imageUrl = "";
+    if (_mprMode) {
+      imageUrl =
+      "http://127.0.0.1:8000/studies/${widget.study['study_id']}/mpr"
+          "?orientation=$_mprOrientation"
+          "&slice_index=$_mprSliceIndex";
     } else if (_images.isNotEmpty) {
       final currentImage = _images[_currentImageIndex];
-      final String mprView = _currentView.name;
-      final String imageUrl =
-          "http://127.0.0.1:8000/studies/${widget.study['study_id']}/series/${_seriesList[_selectedSeries]['series_id']}/image/${currentImage['image_id']}?format=jpeg&mpr=$mprView&window=$_window&level=$_level";
-      imageWidget = Image.network(
-        imageUrl,
-        width: imageSize.width,
-        height: imageSize.height,
-        fit: BoxFit.contain,
-        errorBuilder: (context, error, stackTrace) =>
-        const Icon(Icons.broken_image, size: 64, color: Colors.red),
-        loadingBuilder: (context, child, progress) {
-          if (progress == null) return child;
-          return const Center(child: CircularProgressIndicator());
-        },
-      );
-    } else {
-      imageWidget = const Center(
-        child: Text(
-          "No images.",
-          style: TextStyle(color: Colors.white70, fontSize: 16),
-        ),
-      );
+      imageUrl =
+      "http://127.0.0.1:8000/studies/${widget.study['study_id']}/series/${_seriesList[_selectedSeries]['series_id']}/image/${currentImage['image_id']}?format=jpeg";
     }
 
+    Widget imageWidget = imageUrl.isEmpty
+        ? const Center(
+        child: Text("No images.",
+            style: TextStyle(color: Colors.white70, fontSize: 16)))
+        : CachedNetworkImage(
+      imageUrl: imageUrl,
+      width: imageSize.width,
+      height: imageSize.height,
+      fit: BoxFit.contain,
+      placeholder: (context, url) =>
+      const Center(child: CircularProgressIndicator()),
+      errorWidget: (context, url, error) =>
+      const Icon(Icons.broken_image, size: 64, color: Colors.red),
+      memCacheWidth: imageSize.width.toInt(),
+      memCacheHeight: imageSize.height.toInt(),
+    );
     Widget stackContent = LayoutBuilder(
       builder: (context, constraints) {
         final displaySize = constraints.biggest;
@@ -1529,6 +1873,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
                   pixelSpacingX: pixelSpacingX,
                   pixelSpacingY: pixelSpacingY,
                   imageSize: imageSize,
+                  currentZoom: _zoom,
+                  currentPanOffset: _panOffset,
                 ),
                 size: displaySize,
               ),
@@ -1545,68 +1891,104 @@ class _ViewerScreenState extends State<ViewerScreen> {
       ],
     );
 
-    Widget leftPanel = _fullScreen
-        ? const SizedBox()
-        : Container(
-      width: 120,
-      color: Colors.grey[900],
-      child: ListView.builder(
-        itemCount: _seriesList.length,
-        itemBuilder: (context, idx) {
-          final series = _seriesList[idx];
-          final isSelected = idx == _selectedSeries;
-          return GestureDetector(
-            onTap: () {
-              setState(() {
-                _selectedSeries = idx;
-                _currentImageIndex = 0;
-                _images = _seriesList[_selectedSeries]['images'] ?? [];
-                _linearMeasurements.clear();
-                _circleMeasurements.clear();
-                _markups.clear();
-              });
-            },
-            child: Card(
-              color: isSelected ? Colors.blueGrey[900] : Colors.grey[800],
-              elevation: isSelected ? 4 : 1,
-              margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-              shape: RoundedRectangleBorder(
-                side: BorderSide(
-                  color: isSelected ? Colors.blue : Colors.transparent,
-                  width: 2,
-                ),
-                borderRadius: BorderRadius.circular(8),
-              ),
+    Widget leftPanel() {
+      return _fullScreen
+          ? const SizedBox()
+          : Stack(
+        children: [
+          Container(
+            width: 120,
+            color: Colors.grey[900],
+            child: ListView.builder(
+              itemCount: _seriesList.length,
+              itemBuilder: (context, idx) {
+                final series = _seriesList[idx];
+                final isSelected = idx == _selectedSeries && !_mprMode;
+                return GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _selectedSeries = idx;
+                      _loadSeries();
+                      _linearMeasurements.clear();
+                      _circleMeasurements.clear();
+                      _markups.clear();
+                    });
+                  },
+                  child: Card(
+                    color: isSelected ? Colors.blueGrey[900] : Colors.grey[800],
+                    elevation: isSelected ? 4 : 1,
+                    margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+                    shape: RoundedRectangleBorder(
+                      side: BorderSide(
+                        color: isSelected ? Colors.blue : Colors.transparent,
+                        width: 2,
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(8.0),
+                          child: Icon(
+                            series['thumbnail'] ?? Icons.photo,
+                            size: 48,
+                            color: isSelected ? Colors.blue : Colors.grey,
+                          ),
+                        ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4.0),
+                          child: Text(
+                            series['seriesDescription'] ?? '',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                              fontSize: 12,
+                              color: isSelected ? Colors.blue : Colors.white70,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          if (_seriesLoading)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 12,
               child: Column(
+                mainAxisAlignment: MainAxisAlignment.end,
                 children: [
                   Padding(
-                    padding: const EdgeInsets.all(8.0),
-                    child: Icon(
-                      series['thumbnail'] ?? Icons.photo,
-                      size: 48,
-                      color: isSelected ? Colors.blue : Colors.grey,
+                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    child: LinearProgressIndicator(
+                      value: _seriesLoadingProgress,
+                      minHeight: 10,
+                      backgroundColor: Colors.grey[800],
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.blueAccent),
                     ),
                   ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 4.0),
-                    child: Text(
-                      series['seriesDescription'] ?? '',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
-                        fontSize: 12,
-                        color: isSelected ? Colors.blue : Colors.white70,
-                      ),
+                  const SizedBox(height: 2),
+                  Text(
+                    'Loading... ${(_seriesLoadingProgress * 100).toStringAsFixed(0)}%',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      shadows: [Shadow(blurRadius: 2, color: Colors.black)],
                     ),
+                    textAlign: TextAlign.center,
                   ),
-                  const SizedBox(height: 8),
                 ],
               ),
             ),
-          );
-        },
-      ),
-    );
+        ],
+      );
+    }
 
     Widget toolsPanel = Container(
       width: 170,
@@ -1682,7 +2064,7 @@ class _ViewerScreenState extends State<ViewerScreen> {
         children: [
           Row(
             children: [
-              leftPanel,
+              leftPanel(),
               Expanded(child: imageViewerArea),
               if (!_fullScreen) toolsPanel,
             ],
@@ -1693,5 +2075,3 @@ class _ViewerScreenState extends State<ViewerScreen> {
     );
   }
 }
-
-// MainNavigation, HomeScreen, UploadScreen remain unchanged and should match your last working version.
