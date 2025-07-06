@@ -39,24 +39,18 @@ def remove_progress(task_id):
         if task_id in progress_data:
             del progress_data[task_id]
 
-# === Helper for cleaning up temp dirs ===
 def safe_rmtree(path):
     try:
         shutil.rmtree(path)
     except Exception:
         pass
 
-# === Helper for background upload with simulated progress ===
 def background_forward_upload(task_id, temp_dir, file_paths, endpoint):
     try:
-        # 1. Set progress at 50% (files received by proxy)
         set_progress(task_id, 0.5, "uploading to backend")
-
-        # 2. Prepare files for requests
         files_payload = []
         for fp in file_paths:
             files_payload.append(('files', (os.path.basename(fp), open(fp, 'rb'))))
-        # 3. Simulate progress 50%->95% while uploading
         def do_post():
             try:
                 resp = requests.post(f"{MAIN_BACKEND_URL}{endpoint}", files=files_payload)
@@ -64,8 +58,6 @@ def background_forward_upload(task_id, temp_dir, file_paths, endpoint):
             finally:
                 for _, (_, f) in files_payload:
                     f.close()
-
-        # Launch the POST in thread so we can simulate progress
         future = executor.submit(do_post)
         prog = 0.5
         while not future.done():
@@ -106,14 +98,12 @@ def background_forward_zip(task_id, temp_dir, zip_path, endpoint, fieldname="fil
     finally:
         safe_rmtree(temp_dir)
 
-# === Upload folder endpoint ===
 @app.post("/proxy/upload/")
 async def proxy_upload(files: List[UploadFile] = File(...)):
     task_id = str(uuid4())
     temp_dir = tempfile.mkdtemp()
     file_paths = []
     try:
-        # Save files to temp dir
         total = len(files)
         for idx, file in enumerate(files):
             out_path = os.path.join(temp_dir, file.filename)
@@ -126,7 +116,6 @@ async def proxy_upload(files: List[UploadFile] = File(...)):
                     f.write(chunk)
             file_paths.append(out_path)
             set_progress(task_id, (idx+1)/(total*2), "receiving files")
-        # Forward in background
         threading.Thread(
             target=background_forward_upload,
             args=(task_id, temp_dir, file_paths, "/upload/"),
@@ -138,7 +127,6 @@ async def proxy_upload(files: List[UploadFile] = File(...)):
         set_progress(task_id, 1.0, f"error:{e}")
         raise HTTPException(500, f"Proxy upload error: {e}")
 
-# === Upload ZIP endpoint ===
 @app.post("/proxy/upload_zip/")
 async def proxy_upload_zip(file: UploadFile = File(...)):
     task_id = str(uuid4())
@@ -163,58 +151,32 @@ async def proxy_upload_zip(file: UploadFile = File(...)):
         set_progress(task_id, 1.0, f"error:{e}")
         raise HTTPException(500, f"Proxy upload_zip error: {e}")
 
-# === Progress endpoint ===
 @app.get("/proxy/progress/{task_id}")
 def proxy_progress(task_id: str):
     return get_progress(task_id)
 
-# === Proxy export endpoints (download study/series/slice) ===
-@app.get("/proxy/study/{study_id}/download")
-def proxy_download_study(study_id: str, format: str = "jpeg"):
-    backend_url = f"{MAIN_BACKEND_URL}/studies/{study_id}/export/zip?format={format}"
-    resp = requests.get(backend_url, stream=True)
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code, f"Backend error: {resp.text}")
-    # Forward the zip stream
-    return StreamingResponse(resp.raw, media_type="application/zip", headers={
-        "Content-Disposition": resp.headers.get("Content-Disposition", f"attachment; filename=study_{study_id}_{format}.zip")
-    })
-
 @app.get("/proxy/series/{study_id}/{series_id}/download")
 def proxy_download_series(study_id: str, series_id: str, format: str = "jpeg"):
-    backend_url = f"{MAIN_BACKEND_URL}/studies/{study_id}/series/{series_id}/export/zip?format={format}"
+    backend_url = f"{MAIN_BACKEND_URL}/studies/{study_id}/series/{series_id}/export/file?format={format}"
     resp = requests.get(backend_url, stream=True)
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, f"Backend error: {resp.text}")
-    return StreamingResponse(resp.raw, media_type="application/zip", headers={
-        "Content-Disposition": resp.headers.get("Content-Disposition", f"attachment; filename=series_{series_id}_{format}.zip")
-    })
+    headers = {}
+    if 'content-disposition' in resp.headers:
+        headers["Content-Disposition"] = resp.headers["content-disposition"]
+    return StreamingResponse(resp.raw, media_type=resp.headers.get("content-type", "application/octet-stream"), headers=headers)
 
-@app.post("/proxy/export/slice")
-async def proxy_export_slice(request: Request):
-    # Forward POST to backend with form/multipart data as is
-    backend_url = f"{MAIN_BACKEND_URL}/export/slice"
-    form = await request.form()
-    files = []
-    data = {}
-    for k, v in form.multi_items():
-        if isinstance(v, UploadFile):
-            files.append(('image_file', (v.filename, await v.read(), v.content_type)))
-        else:
-            data[k] = v
-    resp = requests.post(backend_url, data=data, files=files, stream=True)
+@app.get("/proxy/study/{study_id}/download")
+def proxy_download_study(study_id: str, format: str = "jpeg"):
+    backend_url = f"{MAIN_BACKEND_URL}/studies/{study_id}/export/file?format={format}"
+    resp = requests.get(backend_url, stream=True)
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, f"Backend error: {resp.text}")
-    return StreamingResponse(resp.raw, media_type="application/zip", headers={
-        "Content-Disposition": resp.headers.get("Content-Disposition", "attachment; filename=slice_export.zip")
-    })
+    headers = {}
+    if 'content-disposition' in resp.headers:
+        headers["Content-Disposition"] = resp.headers["content-disposition"]
+    return StreamingResponse(resp.raw, media_type=resp.headers.get("content-type", "application/octet-stream"), headers=headers)
 
-# === CORS preflight ===
 @app.options("/{rest_of_path:path}")
 async def preflight(rest_of_path: str):
     return Response(headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "*"})
-
-# === Optional: WebSocket for progress (not implemented here) ===
-
-# === Clean up progress records after a while (optional improvement) ===
-# You could launch a background thread to periodically remove old task_ids from progress_data.

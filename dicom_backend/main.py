@@ -1,5 +1,5 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Query, Form
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Query, Form, status
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import os
 import shutil
@@ -9,13 +9,13 @@ from typing import List, Dict, Any
 from PIL import Image
 import io
 import hashlib
-import zipfile
 import json
 from cachetools import LRUCache
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import tempfile
 import re
+import zipfile
 import SimpleITK as sitk
 
 try:
@@ -32,14 +32,6 @@ METADATA_FILENAME = "metadata.json"
 
 DEFAULT_WINDOW = 2000
 DEFAULT_LEVEL = 1000
-
-WINDOW_PRESETS = {
-    "ct_lung": {"window": 1500, "level": -600},
-    "ct_soft": {"window": 400, "level": 40},
-    "ct_bone": {"window": 2000, "level": 500},
-    "mri": {"window": 350, "level": 50},
-    "default": {"window": None, "level": None}
-}
 
 jpeg_cache = LRUCache(maxsize=2048)
 mpr_cache = LRUCache(maxsize=512)
@@ -219,186 +211,153 @@ def iter_file_chunks(file_path, chunk_size=8192):
 
 app.mount("/images", StaticFiles(directory=UPLOAD_ROOT), name="images")
 
-# --- EXPORT ENDPOINTS ---
-
-@app.post("/export/slice")
-async def export_slice_with_markup(
-        patient_name: str = Form(...),
-        age: str = Form(...),
-        sex: str = Form(...),
-        study_desc: str = Form(...),
-        study_date: str = Form(...),
-        series_desc: str = Form(...),
-        image_file: UploadFile = File(...),
-):
-    folder_name = f"{safe_name(patient_name)} {safe_name(age+sex)} {safe_name(study_desc)} {safe_name(study_date)}"
-    subfolder = safe_name(series_desc)
-    tempdir = tempfile.mkdtemp()
-    try:
-        root = os.path.join(tempdir, folder_name, subfolder)
-        os.makedirs(root, exist_ok=True)
-        out_path = os.path.join(root, "slice.jpeg")
-        with open(out_path, "wb") as f:
-            f.write(await image_file.read())
-        zip_path = os.path.join(tempdir, "export.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for dirpath, _, filenames in os.walk(tempdir):
-                for file in filenames:
-                    if file.endswith(".jpeg"):
-                        zipf.write(os.path.join(dirpath, file), os.path.relpath(os.path.join(dirpath, file), tempdir))
-        return StreamingResponse(open(zip_path, "rb"), media_type="application/zip",
-                                 headers={"Content-Disposition": f"attachment; filename={folder_name}_slice.zip"})
-    finally:
-        shutil.rmtree(tempdir)
-
-@app.get("/studies/{study_id}/series/{series_id}/export/zip")
-def export_series_zip(study_id: str, series_id: str, format: str = Query("jpeg")):
+@app.get("/studies/{study_id}/series/{series_id}/export/file")
+def export_series_file(study_id: str, series_id: str, format: str = Query("jpeg")):
     study_dir = get_study_dir(study_id)
     jpeg_dir = get_jpeg_dir(study_id)
     meta_json = load_metadata_json(study_id)
     if not meta_json:
         raise HTTPException(404, "Study not found")
-    series = None
-    for s in meta_json["series"]:
-        if s["series_id"] == series_id:
-            series = s
-            break
-    if series is None:
+    series = next((s for s in meta_json["series"] if s["series_id"] == series_id), None)
+    if not series:
         raise HTTPException(404, "Series not found")
-    patient_folder = f"{safe_name(meta_json['patientName'])} {safe_name(meta_json['studyDate'])} {safe_name(meta_json['description'])}"
     series_folder = safe_name(series["seriesDescription"])
-    tempdir = tempfile.mkdtemp()
-    try:
-        root = os.path.join(tempdir, patient_folder, series_folder)
-        os.makedirs(root, exist_ok=True)
-        if format == "dicom":
-            for img in series["images"]:
-                dcm_path = os.path.join(study_dir, img["filename"])
-                if os.path.exists(dcm_path):
-                    shutil.copy(dcm_path, os.path.join(root, os.path.basename(img["filename"])))
-        elif format == "jpeg":
+    patient_folder = f"{safe_name(meta_json['patientName'])}_{safe_name(meta_json['studyDate'])}_{safe_name(meta_json['description'])}"
+
+    if format == "jpeg":
+        # Export all JPEGs as a zip
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        with zipfile.ZipFile(temp_zip, "w") as zipf:
             for img in series["images"]:
                 jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
                 if os.path.exists(jpeg_path):
-                    shutil.copy(jpeg_path, os.path.join(root, os.path.basename(img["jpeg_filename"])))
-        elif format == "mp4":
-            if not MOVIEPY_AVAILABLE:
-                raise HTTPException(500, "moviepy not installed on server")
-            frames = []
+                    zipf.write(jpeg_path, arcname=img["jpeg_filename"])
+        temp_zip.close()
+        return FileResponse(temp_zip.name, filename=f"{patient_folder}_{series_folder}.zip", media_type="application/zip")
+    elif format == "dicom":
+        # Export all DICOMs as a zip
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        with zipfile.ZipFile(temp_zip, "w") as zipf:
+            for img in series["images"]:
+                dcm_path = os.path.join(study_dir, img["filename"])
+                if os.path.exists(dcm_path):
+                    zipf.write(dcm_path, arcname=img["filename"])
+        temp_zip.close()
+        return FileResponse(temp_zip.name, filename=f"{patient_folder}_{series_folder}_dicom.zip", media_type="application/zip")
+    elif format == "mp4":
+        if not MOVIEPY_AVAILABLE:
+            raise HTTPException(500, "moviepy not installed on server")
+        frames = []
+        for img in series["images"]:
+            jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
+            if os.path.exists(jpeg_path):
+                frames.append(np.array(Image.open(jpeg_path)))
+        if not frames:
+            raise HTTPException(404, "No JPEGs found for MP4 export")
+        tempdir = tempfile.mkdtemp()
+        try:
+            mp4_path = os.path.join(tempdir, f"{series_folder}.mp4")
+            clip = mpy.ImageSequenceClip(frames, fps=12)
+            clip.write_videofile(mp4_path, codec="libx264", fps=12, audio=False, verbose=False, logger=None)
+            filename = f"{patient_folder}_{series_folder}.mp4"
+            return FileResponse(mp4_path, filename=filename, media_type="video/mp4")
+        finally:
+            shutil.rmtree(tempdir)
+    else:
+        raise HTTPException(400, "Invalid format requested")
+
+@app.get("/studies/{study_id}/export/file")
+def export_study_file(study_id: str, format: str = Query("jpeg")):
+    study_dir = get_study_dir(study_id)
+    jpeg_dir = get_jpeg_dir(study_id)
+    meta_json = load_metadata_json(study_id)
+    if not meta_json:
+        raise HTTPException(404, "Study not found")
+    patient_folder = f"{safe_name(meta_json['patientName'])}_{safe_name(meta_json['studyDate'])}_{safe_name(meta_json['description'])}"
+    if format == "jpeg":
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        with zipfile.ZipFile(temp_zip, "w") as zipf:
+            for series in meta_json["series"]:
+                series_folder = safe_name(series["seriesDescription"])
+                for img in series["images"]:
+                    jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
+                    if os.path.exists(jpeg_path):
+                        zipf.write(jpeg_path, arcname=f"{series_folder}/{img['jpeg_filename']}")
+        temp_zip.close()
+        return FileResponse(temp_zip.name, filename=f"{patient_folder}.zip", media_type="application/zip")
+    elif format == "dicom":
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        with zipfile.ZipFile(temp_zip, "w") as zipf:
+            for series in meta_json["series"]:
+                series_folder = safe_name(series["seriesDescription"])
+                for img in series["images"]:
+                    dcm_path = os.path.join(study_dir, img["filename"])
+                    if os.path.exists(dcm_path):
+                        zipf.write(dcm_path, arcname=f"{series_folder}/{img['filename']}")
+        temp_zip.close()
+        return FileResponse(temp_zip.name, filename=f"{patient_folder}_dicom.zip", media_type="application/zip")
+    elif format == "mp4":
+        if not MOVIEPY_AVAILABLE:
+            raise HTTPException(500, "moviepy not installed on server")
+        frames = []
+        for series in meta_json["series"]:
             for img in series["images"]:
                 jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
                 if os.path.exists(jpeg_path):
                     frames.append(np.array(Image.open(jpeg_path)))
-            if not frames:
-                raise HTTPException(404, "No JPEGs found for MP4 export")
-            duration = max(2, len(frames) // 12)
+        if not frames:
+            raise HTTPException(404, "No JPEGs found for MP4 export")
+        tempdir = tempfile.mkdtemp()
+        try:
+            mp4_path = os.path.join(tempdir, f"{patient_folder}.mp4")
             clip = mpy.ImageSequenceClip(frames, fps=12)
-            mp4_path = os.path.join(root, f"{series_folder}.mp4")
             clip.write_videofile(mp4_path, codec="libx264", fps=12, audio=False, verbose=False, logger=None)
-        zip_path = os.path.join(tempdir, "export.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for dirpath, _, filenames in os.walk(tempdir):
-                for file in filenames:
-                    if file.endswith(".dcm") or file.endswith(".jpg") or file.endswith(".mp4"):
-                        zipf.write(os.path.join(dirpath, file), os.path.relpath(os.path.join(dirpath, file), tempdir))
-        return StreamingResponse(open(zip_path, "rb"), media_type="application/zip",
-                                 headers={"Content-Disposition": f"attachment; filename={patient_folder}_{series_folder}_{format}.zip"})
-    finally:
-        shutil.rmtree(tempdir)
+            filename = f"{patient_folder}.mp4"
+            return FileResponse(mp4_path, filename=filename, media_type="video/mp4")
+        finally:
+            shutil.rmtree(tempdir)
+    else:
+        raise HTTPException(400, "Invalid format requested")
 
-@app.get("/studies/{study_id}/export/zip")
-def export_study_zip(study_id: str, format: str = Query("jpeg")):
+@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}")
+def get_series_image(study_id: str, series_id: str, image_id: str, format: str = Query("jpeg")):
     study_dir = get_study_dir(study_id)
     jpeg_dir = get_jpeg_dir(study_id)
     meta_json = load_metadata_json(study_id)
     if not meta_json:
         raise HTTPException(404, "Study not found")
-    patient_folder = f"{safe_name(meta_json['patientName'])} {safe_name(meta_json['studyDate'])} {safe_name(meta_json['description'])}"
-    tempdir = tempfile.mkdtemp()
-    try:
-        study_root = os.path.join(tempdir, patient_folder)
-        os.makedirs(study_root, exist_ok=True)
-        for series in meta_json["series"]:
-            series_folder = safe_name(series["seriesDescription"])
-            series_root = os.path.join(study_root, series_folder)
-            os.makedirs(series_root, exist_ok=True)
-            if format == "dicom":
-                for img in series["images"]:
-                    dcm_path = os.path.join(study_dir, img["filename"])
-                    if os.path.exists(dcm_path):
-                        shutil.copy(dcm_path, os.path.join(series_root, os.path.basename(img["filename"])))
-            elif format == "jpeg":
-                for img in series["images"]:
-                    jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
-                    if os.path.exists(jpeg_path):
-                        shutil.copy(jpeg_path, os.path.join(series_root, os.path.basename(img["jpeg_filename"])))
-            elif format == "mp4":
-                if not MOVIEPY_AVAILABLE:
-                    raise HTTPException(500, "moviepy not installed on server")
-                frames = []
-                for img in series["images"]:
-                    jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
-                    if os.path.exists(jpeg_path):
-                        frames.append(np.array(Image.open(jpeg_path)))
-                if not frames:
-                    continue
-                duration = max(2, len(frames) // 12)
-                clip = mpy.ImageSequenceClip(frames, fps=12)
-                mp4_path = os.path.join(series_root, f"{series_folder}.mp4")
-                clip.write_videofile(mp4_path, codec="libx264", fps=12, audio=False, verbose=False, logger=None)
-        zip_path = os.path.join(tempdir, "export.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for dirpath, _, filenames in os.walk(tempdir):
-                for file in filenames:
-                    if file.endswith(".dcm") or file.endswith(".jpg") or file.endswith(".mp4"):
-                        zipf.write(os.path.join(dirpath, file), os.path.relpath(os.path.join(dirpath, file), tempdir))
-        return StreamingResponse(open(zip_path, "rb"), media_type="application/zip",
-                                 headers={"Content-Disposition": f"attachment; filename={patient_folder}_{format}.zip"})
-    finally:
-        shutil.rmtree(tempdir)
-
-@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}/export")
-def export_single_image(study_id: str, series_id: str, image_id: str):
-    study_dir = get_study_dir(study_id)
-    jpeg_dir = get_jpeg_dir(study_id)
-    meta_json = load_metadata_json(study_id)
-    if not meta_json:
-        raise HTTPException(404, "Study not found")
-    series = None
-    img = None
-    for s in meta_json["series"]:
-        if s["series_id"] == series_id:
-            series = s
-            for i in s["images"]:
-                if i["image_id"] == image_id:
-                    img = i
-                    break
-    if img is None:
+    series = next((s for s in meta_json["series"] if s["series_id"] == series_id), None)
+    if not series:
+        raise HTTPException(404, "Series not found")
+    image = next((img for img in series["images"] if img["image_id"] == image_id), None)
+    if not image:
         raise HTTPException(404, "Image not found")
-    patient_folder = f"{safe_name(meta_json['patientName'])} {safe_name(meta_json['studyDate'])} {safe_name(meta_json['description'])}"
-    series_folder = safe_name(series["seriesDescription"])
-    tempdir = tempfile.mkdtemp()
-    try:
-        root = os.path.join(tempdir, patient_folder, series_folder)
-        os.makedirs(root, exist_ok=True)
-        dcm_path = os.path.join(study_dir, img["filename"])
-        if os.path.exists(dcm_path):
-            shutil.copy(dcm_path, os.path.join(root, os.path.basename(img["filename"])))
-        jpeg_path = os.path.join(jpeg_dir, img["jpeg_filename"])
-        if os.path.exists(jpeg_path):
-            shutil.copy(jpeg_path, os.path.join(root, os.path.basename(img["jpeg_filename"])))
-        zip_path = os.path.join(tempdir, "export.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for dirpath, _, filenames in os.walk(tempdir):
-                for file in filenames:
-                    if file.endswith(".dcm") or file.endswith(".jpg"):
-                        zipf.write(os.path.join(dirpath, file), os.path.relpath(os.path.join(dirpath, file), tempdir))
-        return StreamingResponse(open(zip_path, "rb"), media_type="application/zip",
-                                 headers={"Content-Disposition": f"attachment; filename={patient_folder}_{series_folder}_{image_id}.zip"})
-    finally:
-        shutil.rmtree(tempdir)
+    if format == "jpeg":
+        jpeg_path = os.path.join(jpeg_dir, image["jpeg_filename"])
+        if not os.path.exists(jpeg_path):
+            dcm_path = os.path.join(study_dir, image["filename"])
+            if not os.path.exists(dcm_path):
+                raise HTTPException(404, "DICOM not found")
+            dcm2jpeg(dcm_path, jpeg_path)
+        return FileResponse(jpeg_path, media_type="image/jpeg")
+    elif format == "dicom":
+        dcm_path = os.path.join(study_dir, image["filename"])
+        if not os.path.exists(dcm_path):
+            raise HTTPException(404, "DICOM not found")
+        return FileResponse(dcm_path, media_type="application/dicom")
+    else:
+        raise HTTPException(400, "Invalid format")
 
-# --- REST OF THE DICOM APP (core endpoints, unchanged from before) ---
+@app.delete("/studies/{study_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_study(study_id: str):
+    study_dir = get_study_dir(study_id)
+    if not os.path.exists(study_dir):
+        raise HTTPException(404, "Study not found")
+    try:
+        shutil.rmtree(study_dir)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to delete study: {e}")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @app.post("/upload/")
 async def upload_files(files: List[UploadFile] = File(...)):
@@ -501,203 +460,3 @@ def get_study_detail(study_id: str):
     if not meta_json:
         meta_json = build_metadata_json(study_id, study_dir)
     return JSONResponse(make_json_serializable(meta_json))
-
-@app.get("/presets")
-def get_window_presets():
-    return JSONResponse(WINDOW_PRESETS)
-
-@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}")
-def get_image(
-        study_id: str,
-        series_id: str,
-        image_id: str,
-        format: str = "jpeg",
-):
-    cache_key = jpeg_cache_key(study_id, series_id, image_id)
-    if cache_key in jpeg_cache:
-        return Response(
-            content=jpeg_cache[cache_key],
-            media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=31536000"}
-        )
-    meta_json = load_metadata_json(study_id)
-    if not meta_json:
-        raise HTTPException(404, "Metadata not found")
-    for series in meta_json["series"]:
-        if series["series_id"] == series_id:
-            for img in series["images"]:
-                if img["image_id"] == image_id:
-                    jpeg_path = os.path.join(get_jpeg_dir(study_id), img["jpeg_filename"])
-                    if not os.path.exists(jpeg_path):
-                        raise HTTPException(404, "JPEG not found")
-                    with open(jpeg_path, "rb") as jf:
-                        jpeg_bytes = jf.read()
-                        jpeg_cache[cache_key] = jpeg_bytes
-                        return Response(
-                            content=jpeg_bytes,
-                            media_type="image/jpeg",
-                            headers={"Cache-Control": "public, max-age=31536000"}
-                        )
-    raise HTTPException(404, "Image not found")
-
-@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}/raw")
-def get_image_raw(
-        study_id: str,
-        series_id: str,
-        image_id: str,
-):
-    meta_json = load_metadata_json(study_id)
-    if not meta_json:
-        raise HTTPException(404, "Metadata not found")
-    study_dir = get_study_dir(study_id)
-    for series in meta_json["series"]:
-        if series["series_id"] == series_id:
-            for img in series["images"]:
-                if img["image_id"] == image_id:
-                    dcm_path = os.path.join(study_dir, img["filename"])
-                    if not os.path.exists(dcm_path):
-                        raise HTTPException(404, "DICOM not found")
-                    return FileResponse(dcm_path, media_type="application/dicom")
-    raise HTTPException(404, "Image not found")
-
-@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}/metadata")
-def get_image_metadata(study_id: str, series_id: str, image_id: str):
-    meta_json = load_metadata_json(study_id)
-    if not meta_json:
-        raise HTTPException(404, "Metadata not found")
-    for series in meta_json["series"]:
-        if series["series_id"] == series_id:
-            for img in series["images"]:
-                if img["image_id"] == image_id:
-                    return {
-                        "pixelSpacingX": img["pixelSpacingX"],
-                        "pixelSpacingY": img["pixelSpacingY"],
-                        "Columns": img["Columns"],
-                        "Rows": img["Rows"],
-                        "WindowCenter": img.get("WindowCenter"),
-                        "WindowWidth": img.get("WindowWidth"),
-                    }
-    raise HTTPException(404, "Image not found")
-
-@app.get("/studies/{study_id}/mpr")
-def mpr_image(
-        study_id: str,
-        orientation: str = Query(..., description="axial, coronal, sagittal"),
-        slice_index: int = Query(..., description="Slice index (0-based)"),
-):
-    cache_key = mpr_cache_key(study_id, orientation, slice_index)
-    if cache_key in mpr_cache:
-        return Response(
-            content=mpr_cache[cache_key],
-            media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=31536000"}
-        )
-    with mpr_semaphore:
-        study_dir = get_study_dir(study_id)
-        if not os.path.exists(study_dir) or not os.path.isdir(study_dir):
-            raise HTTPException(404, "Study not found")
-
-        dicom_files = get_all_dicoms(study_dir)
-        if not dicom_files:
-            raise HTTPException(404, "No DICOM files found for study")
-
-        try:
-            reader = sitk.ImageSeriesReader()
-            series_IDs = reader.GetGDCMSeriesIDs(study_dir)
-            if not series_IDs:
-                raise HTTPException(404, "No DICOM series found for study")
-            series_file_names = reader.GetGDCMSeriesFileNames(study_dir, series_IDs[0])
-            reader.SetFileNames(series_file_names)
-            image3d = reader.Execute()
-            np_volume = sitk.GetArrayFromImage(image3d)
-            w = float(DEFAULT_WINDOW)
-            l = float(DEFAULT_LEVEL)
-            if orientation == "axial":
-                if slice_index < 0 or slice_index >= np_volume.shape[0]:
-                    raise HTTPException(400, f"Slice index out of range (0-{np_volume.shape[0]-1})")
-                slice_img = np_volume[slice_index, :, :]
-            elif orientation == "coronal":
-                if slice_index < 0 or slice_index >= np_volume.shape[1]:
-                    raise HTTPException(400, f"Slice index out of range (0-{np_volume.shape[1]-1})")
-                slice_img = np_volume[:, slice_index, :]
-            elif orientation == "sagittal":
-                if slice_index < 0 or slice_index >= np_volume.shape[2]:
-                    raise HTTPException(400, f"Slice index out of range (0-{np_volume.shape[2]-1})")
-                slice_img = np_volume[:, :, slice_index]
-            else:
-                raise HTTPException(400, "Unknown orientation (choose axial, coronal, sagittal)")
-            arr = np.clip((slice_img - (l - 0.5)) / (w - 1) + 0.5, 0, 1) * 255
-            arr = arr.astype(np.uint8)
-            img = Image.fromarray(arr)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG")
-            buf.seek(0)
-            jpeg_bytes = buf.read()
-            mpr_cache[cache_key] = jpeg_bytes
-            return Response(content=jpeg_bytes, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=31536000"})
-        except Exception as e:
-            raise HTTPException(500, f"Failed to generate MPR: {e}")
-
-@app.get("/studies/{study_id}/mpr_info")
-def mpr_info(
-        study_id: str,
-        orientation: str = Query(..., description="axial, coronal, sagittal"),
-):
-    study_dir = get_study_dir(study_id)
-    if not os.path.exists(study_dir) or not os.path.isdir(study_dir):
-        raise HTTPException(404, "Study not found")
-
-    dicom_files = get_all_dicoms(study_dir)
-    if not dicom_files:
-        raise HTTPException(404, "No DICOM files found for study")
-
-    try:
-        reader = sitk.ImageSeriesReader()
-        series_IDs = reader.GetGDCMSeriesIDs(study_dir)
-        if not series_IDs:
-            raise HTTPException(404, "No DICOM series found for study")
-        series_file_names = reader.GetGDCMSeriesFileNames(study_dir, series_IDs[0])
-        reader.SetFileNames(series_file_names)
-        image3d = reader.Execute()
-        np_volume = sitk.GetArrayFromImage(image3d)
-        if orientation == "axial":
-            num_slices = np_volume.shape[0]
-        elif orientation == "coronal":
-            num_slices = np_volume.shape[1]
-        elif orientation == "sagittal":
-            num_slices = np_volume.shape[2]
-        else:
-            raise HTTPException(400, "Unknown orientation (choose axial, coronal, sagittal)")
-        return {"num_slices": num_slices}
-    except Exception as e:
-        raise HTTPException(500, f"Failed to get MPR info: {e}")
-
-@app.post("/studies/{study_id}/series/{series_id}/image/{image_id}/ai")
-def ai_analysis_endpoint(study_id: str, series_id: str, image_id: str, analysis: Dict[str, Any]):
-    meta_json = load_metadata_json(study_id)
-    if not meta_json:
-        raise HTTPException(404, "Metadata not found")
-    if not meta_json.get("ai_analysis"):
-        meta_json["ai_analysis"] = {}
-    if series_id not in meta_json["ai_analysis"]:
-        meta_json["ai_analysis"][series_id] = {}
-    meta_json["ai_analysis"][series_id][image_id] = analysis
-    with open(get_metadata_path(study_id), "w") as f:
-        json.dump(meta_json, f)
-    return {"status": "AI analysis stored"}
-
-@app.get("/studies/{study_id}/series/{series_id}/image/{image_id}/ai")
-def get_ai_analysis(study_id: str, series_id: str, image_id: str):
-    meta_json = load_metadata_json(study_id)
-    if not meta_json or not meta_json.get("ai_analysis"):
-        return {}
-    return meta_json["ai_analysis"].get(series_id, {}).get(image_id, {})
-
-@app.delete("/studies/{study_id}")
-def delete_study(study_id: str):
-    study_dir = get_study_dir(study_id)
-    if os.path.exists(study_dir) and os.path.isdir(study_dir):
-        shutil.rmtree(study_dir)
-        return {"detail": "Study deleted"}
-    else:
-        raise HTTPException(status_code=404, detail="Study not found")

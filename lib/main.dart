@@ -9,19 +9,9 @@ import 'package:path/path.dart' as p;
 import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:async';
+import 'package:archive/archive_io.dart';
 import 'package:cached_network_image/cached_network_image.dart';
-import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
-import 'dart:typed_data';
-import 'dart:ui' as ui;
-import 'package:file_picker/file_picker.dart';
-import 'dart:io';
-import 'package:http/http.dart' as http;
-import 'package:path/path.dart' as p;
-import 'dart:convert';
-import 'dart:math' as math;
-import 'dart:async';
-import 'package:cached_network_image/cached_network_image.dart';
+
 
 
 // --- Color options ---
@@ -36,6 +26,13 @@ const String proxyBase = "http://127.0.0.1:8010";
 void main() {
   runApp(const DicomViewerApp());
 }
+// Add this helper function at the top-level (outside any class):
+String sanitizeName(String s, {int maxLen = 24}) {
+  String cleaned = s.replaceAll(RegExp(r'[\/\\:*?"<>|]'), '_').replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (cleaned.length > maxLen) cleaned = cleaned.substring(0, maxLen).trim();
+  return cleaned;
+}
+
 
 class DicomViewerApp extends StatelessWidget {
   const DicomViewerApp({super.key});
@@ -742,6 +739,124 @@ class _UploadScreenState extends State<UploadScreen> {
 enum MPRView { axial, coronal, sagittal }
 enum MarkupTool { arrow, line, circle, pen }
 enum MeasurementMode { none, linear, circle }
+enum ExportScope { slice, series, study }
+enum ExportFormat { jpeg, dicom, mp4 }
+
+class ExportDialogResult {
+  final ExportScope scope;
+  final ExportFormat format;
+  final String folderPath;
+  ExportDialogResult(this.scope, this.format, this.folderPath);
+}
+
+Future<ExportDialogResult?> showExportDialog(BuildContext context,
+    {bool allowDicom = true, bool allowMp4 = true}) async {
+  ExportScope scope = ExportScope.slice;
+  ExportFormat format = ExportFormat.jpeg;
+  String folderPath = "";
+
+  return showDialog<ExportDialogResult>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) => AlertDialog(
+            title: Text("Export"),
+            content: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("Export"),
+                  Row(
+                    children: [
+                      Radio<ExportScope>(
+                        value: ExportScope.slice,
+                        groupValue: scope,
+                        onChanged: (v) => setState(() => scope = v!),
+                      ),
+                      Text("Slice"),
+                      Radio<ExportScope>(
+                        value: ExportScope.series,
+                        groupValue: scope,
+                        onChanged: (v) => setState(() => scope = v!),
+                      ),
+                      Text("Current series"),
+                      Radio<ExportScope>(
+                        value: ExportScope.study,
+                        groupValue: scope,
+                        onChanged: (v) => setState(() => scope = v!),
+                      ),
+                      Text("Current study"),
+                    ],
+                  ),
+                  SizedBox(height: 12),
+                  Text("Export as"),
+                  Row(
+                    children: [
+                      Radio<ExportFormat>(
+                        value: ExportFormat.jpeg,
+                        groupValue: format,
+                        onChanged: (v) => setState(() => format = v!),
+                      ),
+                      Text("JPEG"),
+                      Radio<ExportFormat>(
+                        value: ExportFormat.dicom,
+                        groupValue: format,
+                        onChanged: scope == ExportScope.slice || !allowDicom
+                            ? null
+                            : (v) => setState(() => format = v!),
+                      ),
+                      Text("DICOM"),
+                      Radio<ExportFormat>(
+                        value: ExportFormat.mp4,
+                        groupValue: format,
+                        onChanged: scope == ExportScope.slice || !allowMp4
+                            ? null
+                            : (v) => setState(() => format = v!),
+                      ),
+                      Text("MP4"),
+                    ],
+                  ),
+                  SizedBox(height: 12),
+                  Text("Folder: "),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(folderPath.isEmpty
+                            ? "(not selected)"
+                            : folderPath,
+                            overflow: TextOverflow.ellipsis),
+                      ),
+                      ElevatedButton(
+                        onPressed: () async {
+                          String? result = await FilePicker.platform
+                              .getDirectoryPath(
+                              dialogTitle: "Select export folder");
+                          if (result != null)
+                            setState(() => folderPath = result);
+                        },
+                        child: Text("Choose"),
+                      ),
+                    ],
+                  )
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                  onPressed: () => Navigator.pop(context), child: Text("Cancel")),
+              ElevatedButton(
+                onPressed: folderPath.isEmpty
+                    ? null
+                    : () => Navigator.pop(
+                    context,
+                    ExportDialogResult(scope, format, folderPath)),
+                child: Text("Export"),
+              ),
+            ],
+          ),
+        );
+      });
+}
 
 class LinearMeasurement {
   final Offset start;
@@ -1077,6 +1192,7 @@ class ViewerScreen extends StatefulWidget {
   State<ViewerScreen> createState() => _ViewerScreenState();
 }
 
+
 class _ViewerScreenState extends State<ViewerScreen> {
   int _selectedSeries = 0;
   int _currentImageIndex = 0;
@@ -1087,7 +1203,8 @@ class _ViewerScreenState extends State<ViewerScreen> {
   int _mprSliceIndex = 0;
   bool _seriesLoading = false;
   double _seriesLoadingProgress = 0.0;
-
+  bool _exporting = false;
+  double _exportProgress = 0.0;
   MPRView _currentView = MPRView.axial;
   double _zoom = 1.0;
   final double _minZoom = 0.5;
@@ -1120,7 +1237,17 @@ class _ViewerScreenState extends State<ViewerScreen> {
   Offset? _lastPanPointer;
 
   bool get isDemo => widget.study['study_id'] == 'demo';
-
+  Future<void> _smoothProgressTo(double target, Duration totalDuration) async {
+    double start = _exportProgress;
+    int steps = 30;
+    for (int i = 1; i <= steps; i++) {
+      await Future.delayed(totalDuration ~/ steps);
+      double next = start + (target - start) * (i / steps);
+      setState(() {
+        if (next > _exportProgress) _exportProgress = next;
+      });
+    }
+  }
   double get pixelSpacingX {
     if (_images.isEmpty) return 1.0;
     final img = _images[_currentImageIndex];
@@ -1595,62 +1722,124 @@ class _ViewerScreenState extends State<ViewerScreen> {
         minimumSize: Size(110, 35),
         padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
       ),
-      onPressed: () async {
-        try {
-          RenderRepaintBoundary boundary =
-          _exportKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
-          ui.Image image = await boundary.toImage(pixelRatio: 3.0);
-          ByteData? byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-          if (byteData != null) {
-            final pngBytes = byteData.buffer.asUint8List();
-            String fileName =
-                "dicom_annotated_${DateTime.now().millisecondsSinceEpoch}.png";
-            String? dir;
-            if (Platform.isAndroid || Platform.isIOS) {
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  title: const Text('Export Complete'),
-                  content: const Text(
-                      'Annotated image copied to clipboard or use Share in real app.'),
-                  actions: [
-                    TextButton(
-                        onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
-                  ],
-                ),
-              );
-            } else {
-              dir = Directory.current.path;
-              File out = File(p.join(dir, fileName));
-              await out.writeAsBytes(pngBytes);
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  title: const Text('Export Complete'),
-                  content: Text('Saved as $fileName in $dir'),
-                  actions: [
-                    TextButton(
-                        onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
-                  ],
-                ),
-              );
-            }
-          }
-        } catch (e) {
-          showDialog(
-            context: context,
-            builder: (ctx) => AlertDialog(
-              title: const Text('Export Failed'),
-              content: Text(e.toString()),
-              actions: [
-                TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK'))
-              ],
-            ),
-          );
-        }
-      },
       icon: const Icon(Icons.download, size: 18),
       label: const Text('Export', style: TextStyle(fontSize: 13)),
+      onPressed: () async {
+        final result = await showExportDialog(context);
+        if (result == null) return;
+
+        setState(() {
+          _exporting = true;
+          _exportProgress = 0.01;
+        });
+
+        // Extract metadata for folder naming
+        final meta = widget.study;
+        final patientName = (meta['patientName'] ?? 'Unknown').toString();
+        final age = (meta['age'] ?? 'NA').toString();
+        final sex = (meta['sex'] ?? 'NA').toString();
+        final studyType = (meta['description'] ?? 'Study').toString();
+        final date = (meta['studyDate'] ?? 'NA').toString();
+        final folderName = "$patientName - $age - $sex - $studyType - $date";
+        final exportBase = p.join(result.folderPath, folderName);
+
+        if (result.scope == ExportScope.slice) {
+          // Export current slice as JPEG (with markings)
+          try {
+            final boundary = _exportKey.currentContext!
+                .findRenderObject() as RenderRepaintBoundary;
+            final image = await boundary.toImage(pixelRatio: 3.0);
+            final byteData =
+            await image.toByteData(format: ui.ImageByteFormat.png);
+            if (byteData != null) {
+              final pngBytes = byteData.buffer.asUint8List();
+              final outDir = Directory(exportBase);
+              await outDir.create(recursive: true);
+              final outFile = File(p.join(exportBase, "slice.jpeg"));
+              // Fake progress animation for local export
+              for (int i = 1; i <= 10; i++) {
+                await Future.delayed(const Duration(milliseconds: 25));
+                setState(() {
+                  _exportProgress = i / 10;
+                });
+              }
+              await outFile.writeAsBytes(pngBytes);
+              setState(() {
+                _exportProgress = 1.0;
+              });
+              await Future.delayed(const Duration(milliseconds: 400));
+              setState(() {
+                _exporting = false;
+                _exportProgress = 0.0;
+              });
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text("Slice exported to ${outFile.path}")));
+            }
+          } catch (e) {
+            setState(() {
+              _exporting = false;
+              _exportProgress = 0.0;
+            });
+            ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text("Slice export failed: $e")));
+          }
+          return;
+        }
+
+        // For series/study export, call backend and extract zip to folder
+        String url = "";
+        if (result.scope == ExportScope.series) {
+          url =
+          "$proxyBase/proxy/series/${meta['study_id']}/${_seriesList[_selectedSeries]['series_id']}/download?format=${result.format.name}";
+        } else {
+          url =
+          "$proxyBase/proxy/study/${meta['study_id']}/download?format=${result.format.name}";
+        }
+
+        try {
+          final request = http.Request('GET', Uri.parse(url));
+          final response = await http.Client().send(request);
+          final contentLength = response.contentLength ?? 1;
+          int received = 0;
+          List<int> bytes = [];
+          await for (var chunk in response.stream) {
+            bytes.addAll(chunk);
+            received += chunk.length;
+            setState(() {
+              _exportProgress = (received / contentLength).clamp(0.0, 1.0);
+            });
+          }
+          final zipBytes = bytes;
+          final archive = ZipDecoder().decodeBytes(zipBytes);
+          for (final file in archive) {
+            final filePath = p.join(exportBase, file.name);
+            if (file.isFile) {
+              final outFile = File(filePath);
+              await outFile.create(recursive: true);
+              await outFile.writeAsBytes(file.content as List<int>);
+            } else {
+              await Directory(filePath).create(recursive: true);
+            }
+          }
+          setState(() {
+            _exportProgress = 1.0;
+          });
+          await Future.delayed(const Duration(milliseconds: 500));
+          setState(() {
+            _exporting = false;
+            _exportProgress = 0.0;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Exported to $exportBase")));
+        } catch (e) {
+          setState(() {
+            _exporting = false;
+            _exportProgress = 0.0;
+          });
+          ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text("Export failed: $e")));
+        }
+      },
     ),
   );
 
@@ -1689,196 +1878,200 @@ class _ViewerScreenState extends State<ViewerScreen> {
     Widget stackContent = LayoutBuilder(
       builder: (context, constraints) {
         final displaySize = constraints.biggest;
-        return GestureDetector(
-          behavior: HitTestBehavior.translucent,
-          onPanStart: (details) {
-            final local = details.localPosition;
-            final imageCoord = pointerToImageCoords(
-              pointer: local,
-              displaySize: displaySize,
-              imageSize: imageSize,
-            );
-            if (_panMode) {
-              _lastPanPointer = local;
-              return;
-            }
-            if (_measurementMode == MeasurementMode.linear ||
-                _measurementMode == MeasurementMode.circle) {
-              setState(() {
-                _measurementStart = imageCoord;
-                _measurementCurrent = imageCoord;
-              });
-            } else if (_markupTool != null) {
-              if (_markupTool == MarkupTool.arrow ||
-                  _markupTool == MarkupTool.line ||
-                  _markupTool == MarkupTool.circle) {
+        // --- PATCH: Wrap the whole stack in a RepaintBoundary for exporting ---
+        return RepaintBoundary(
+          key: _exportKey,
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onPanStart: (details) {
+              final local = details.localPosition;
+              final imageCoord = pointerToImageCoords(
+                pointer: local,
+                displaySize: displaySize,
+                imageSize: imageSize,
+              );
+              if (_panMode) {
+                _lastPanPointer = local;
+                return;
+              }
+              if (_measurementMode == MeasurementMode.linear ||
+                  _measurementMode == MeasurementMode.circle) {
                 setState(() {
                   _measurementStart = imageCoord;
                   _measurementCurrent = imageCoord;
                 });
-              } else if (_markupTool == MarkupTool.pen) {
-                setState(() {
-                  _currentPenPoints = [imageCoord];
-                });
+              } else if (_markupTool != null) {
+                if (_markupTool == MarkupTool.arrow ||
+                    _markupTool == MarkupTool.line ||
+                    _markupTool == MarkupTool.circle) {
+                  setState(() {
+                    _measurementStart = imageCoord;
+                    _measurementCurrent = imageCoord;
+                  });
+                } else if (_markupTool == MarkupTool.pen) {
+                  setState(() {
+                    _currentPenPoints = [imageCoord];
+                  });
+                }
               }
-            }
-          },
-          onPanUpdate: (details) {
-            final local = details.localPosition;
-            final imageCoord = pointerToImageCoords(
-              pointer: local,
-              displaySize: displaySize,
-              imageSize: imageSize,
-            );
-            if (_panMode && _lastPanPointer != null) {
-              setState(() {
-                _panOffset += details.delta;
-                _lastPanPointer = local;
-              });
-              return;
-            }
+            },
+            onPanUpdate: (details) {
+              final local = details.localPosition;
+              final imageCoord = pointerToImageCoords(
+                pointer: local,
+                displaySize: displaySize,
+                imageSize: imageSize,
+              );
+              if (_panMode && _lastPanPointer != null) {
+                setState(() {
+                  _panOffset += details.delta;
+                  _lastPanPointer = local;
+                });
+                return;
+              }
 
-            if ((_measurementMode == MeasurementMode.linear ||
-                _measurementMode == MeasurementMode.circle) &&
-                _measurementStart != null) {
-              setState(() {
-                _measurementCurrent = imageCoord;
-              });
-            } else if (_markupTool != null) {
-              if ((_markupTool == MarkupTool.arrow ||
-                  _markupTool == MarkupTool.line ||
-                  _markupTool == MarkupTool.circle) &&
+              if ((_measurementMode == MeasurementMode.linear ||
+                  _measurementMode == MeasurementMode.circle) &&
                   _measurementStart != null) {
                 setState(() {
                   _measurementCurrent = imageCoord;
                 });
-              } else if (_markupTool == MarkupTool.pen && _currentPenPoints.isNotEmpty) {
-                setState(() {
-                  _currentPenPoints.add(imageCoord);
-                });
+              } else if (_markupTool != null) {
+                if ((_markupTool == MarkupTool.arrow ||
+                    _markupTool == MarkupTool.line ||
+                    _markupTool == MarkupTool.circle) &&
+                    _measurementStart != null) {
+                  setState(() {
+                    _measurementCurrent = imageCoord;
+                  });
+                } else if (_markupTool == MarkupTool.pen && _currentPenPoints.isNotEmpty) {
+                  setState(() {
+                    _currentPenPoints.add(imageCoord);
+                  });
+                }
               }
-            }
-          },
-          onPanEnd: (details) {
-            if (_panMode) {
-              _lastPanPointer = null;
-              return;
-            }
-            if (_measurementMode == MeasurementMode.linear &&
-                _measurementStart != null &&
-                _measurementCurrent != null) {
-              setState(() {
-                _linearMeasurements.add(
-                  LinearMeasurement(
-                    start: _measurementStart!,
-                    end: _measurementCurrent!,
-                  ),
-                );
-                _measurementStart = null;
-                _measurementCurrent = null;
-              });
-            } else if (_measurementMode == MeasurementMode.circle &&
-                _measurementStart != null &&
-                _measurementCurrent != null) {
-              setState(() {
-                _circleMeasurements.add(
-                  CircleMeasurement(
-                    center: _measurementStart!,
-                    edge: _measurementCurrent!,
-                  ),
-                );
-                _measurementStart = null;
-                _measurementCurrent = null;
-              });
-            } else if (_markupTool != null) {
-              if ((_markupTool == MarkupTool.arrow ||
-                  _markupTool == MarkupTool.line ||
-                  _markupTool == MarkupTool.circle) &&
+            },
+            onPanEnd: (details) {
+              if (_panMode) {
+                _lastPanPointer = null;
+                return;
+              }
+              if (_measurementMode == MeasurementMode.linear &&
                   _measurementStart != null &&
                   _measurementCurrent != null) {
                 setState(() {
-                  _markups.add(
-                    MarkupObject(
-                      tool: _markupTool!,
-                      color: _activeColor,
-                      points: [_measurementStart!, _measurementCurrent!],
+                  _linearMeasurements.add(
+                    LinearMeasurement(
+                      start: _measurementStart!,
+                      end: _measurementCurrent!,
                     ),
                   );
                   _measurementStart = null;
                   _measurementCurrent = null;
                 });
-              } else if (_markupTool == MarkupTool.pen && _currentPenPoints.length > 1) {
+              } else if (_measurementMode == MeasurementMode.circle &&
+                  _measurementStart != null &&
+                  _measurementCurrent != null) {
                 setState(() {
-                  _markups.add(
-                    MarkupObject(
-                      tool: MarkupTool.pen,
-                      color: _activeColor,
-                      penPoints: List.from(_currentPenPoints),
+                  _circleMeasurements.add(
+                    CircleMeasurement(
+                      center: _measurementStart!,
+                      edge: _measurementCurrent!,
                     ),
                   );
-                  _currentPenPoints.clear();
+                  _measurementStart = null;
+                  _measurementCurrent = null;
                 });
+              } else if (_markupTool != null) {
+                if ((_markupTool == MarkupTool.arrow ||
+                    _markupTool == MarkupTool.line ||
+                    _markupTool == MarkupTool.circle) &&
+                    _measurementStart != null &&
+                    _measurementCurrent != null) {
+                  setState(() {
+                    _markups.add(
+                      MarkupObject(
+                        tool: _markupTool!,
+                        color: _activeColor,
+                        points: [_measurementStart!, _measurementCurrent!],
+                      ),
+                    );
+                    _measurementStart = null;
+                    _measurementCurrent = null;
+                  });
+                } else if (_markupTool == MarkupTool.pen &&
+                    _currentPenPoints.length > 1) {
+                  setState(() {
+                    _markups.add(
+                      MarkupObject(
+                        tool: MarkupTool.pen,
+                        color: _activeColor,
+                        penPoints: List.from(_currentPenPoints),
+                      ),
+                    );
+                    _currentPenPoints.clear();
+                  });
+                }
               }
-            }
-          },
-          child: Stack(
-            children: [
-              Center(
-                child: Transform.translate(
-                  offset: _panOffset,
-                  child: Transform.scale(
-                    scale: _zoom,
-                    child: FittedBox(
-                      fit: BoxFit.contain,
-                      child: SizedBox(
-                        width: imageSize.width,
-                        height: imageSize.height,
-                        child: imageWidget,
+            },
+            child: Stack(
+              children: [
+                Center(
+                  child: Transform.translate(
+                    offset: _panOffset,
+                    child: Transform.scale(
+                      scale: _zoom,
+                      child: FittedBox(
+                        fit: BoxFit.contain,
+                        child: SizedBox(
+                          width: imageSize.width,
+                          height: imageSize.height,
+                          child: imageWidget,
+                        ),
                       ),
                     ),
                   ),
                 ),
-              ),
-              CustomPaint(
-                key: _exportKey,
-                painter: MarkupPainter(
-                  lineMeasurements: _linearMeasurements,
-                  circleMeasurements: _circleMeasurements,
-                  tempLine: _measurementMode == MeasurementMode.linear &&
-                      _measurementStart != null &&
-                      _measurementCurrent != null
-                      ? LinearMeasurement(
-                      start: _measurementStart!,
-                      end: _measurementCurrent!)
-                      : null,
-                  tempCircle: _measurementMode == MeasurementMode.circle &&
-                      _measurementStart != null &&
-                      _measurementCurrent != null
-                      ? CircleMeasurement(
-                      center: _measurementStart!,
-                      edge: _measurementCurrent!)
-                      : null,
-                  markups: _markups,
-                  markupTool: _markupTool ?? MarkupTool.arrow,
-                  markupColor: _activeColor,
-                  markupTempPoints: (_markupTool == MarkupTool.arrow ||
-                      _markupTool == MarkupTool.line ||
-                      _markupTool == MarkupTool.circle)
-                      ? (_measurementStart != null && _measurementCurrent != null
-                      ? [_measurementStart!, _measurementCurrent!]
-                      : null)
-                      : (_markupTool == MarkupTool.pen && _currentPenPoints.isNotEmpty
-                      ? _currentPenPoints
-                      : null),
-                  pixelSpacingX: pixelSpacingX,
-                  pixelSpacingY: pixelSpacingY,
-                  imageSize: imageSize,
-                  currentZoom: _zoom,
-                  currentPanOffset: _panOffset,
+                CustomPaint(
+                  painter: MarkupPainter(
+                    lineMeasurements: _linearMeasurements,
+                    circleMeasurements: _circleMeasurements,
+                    tempLine: _measurementMode == MeasurementMode.linear &&
+                        _measurementStart != null &&
+                        _measurementCurrent != null
+                        ? LinearMeasurement(
+                        start: _measurementStart!,
+                        end: _measurementCurrent!)
+                        : null,
+                    tempCircle: _measurementMode == MeasurementMode.circle &&
+                        _measurementStart != null &&
+                        _measurementCurrent != null
+                        ? CircleMeasurement(
+                        center: _measurementStart!,
+                        edge: _measurementCurrent!)
+                        : null,
+                    markups: _markups,
+                    markupTool: _markupTool ?? MarkupTool.arrow,
+                    markupColor: _activeColor,
+                    markupTempPoints: (_markupTool == MarkupTool.arrow ||
+                        _markupTool == MarkupTool.line ||
+                        _markupTool == MarkupTool.circle)
+                        ? (_measurementStart != null && _measurementCurrent != null
+                        ? [_measurementStart!, _measurementCurrent!]
+                        : null)
+                        : (_markupTool == MarkupTool.pen && _currentPenPoints.isNotEmpty
+                        ? _currentPenPoints
+                        : null),
+                    pixelSpacingX: pixelSpacingX,
+                    pixelSpacingY: pixelSpacingY,
+                    imageSize: imageSize,
+                    currentZoom: _zoom,
+                    currentPanOffset: _panOffset,
+                  ),
+                  size: displaySize,
                 ),
-                size: displaySize,
-              ),
-            ],
+              ],
+            ),
           ),
         );
       },
@@ -1886,6 +2079,27 @@ class _ViewerScreenState extends State<ViewerScreen> {
 
     Widget imageViewerArea = Column(
       children: [
+        if (_exporting)
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Column(
+              children: [
+                LinearProgressIndicator(
+                  value: _exportProgress,
+                  minHeight: 10,
+                  backgroundColor: Colors.grey[800],
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.greenAccent),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  _exportProgress < 1.0
+                      ? 'Exporting... ${(_exportProgress * 100).toStringAsFixed(0)}%'
+                      : 'Export complete!',
+                  style: const TextStyle(color: Colors.white70, fontSize: 15),
+                ),
+              ],
+            ),
+          ),
         Expanded(child: stackContent),
         _sliceSlider(),
       ],
